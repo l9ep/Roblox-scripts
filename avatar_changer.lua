@@ -1,973 +1,1522 @@
--- AVATAR CHANGER V97
--- KEY FIX: ApplyDescription blocked by game? Auto-fallback to manual apply
--- Manual apply: clones accessories/clothes/face from model, welds correctly
--- UI: smaller (260x490), same clean B&W design  (XYTHC)
+--[[
+    Avatar Changer V98
+    by XYTHC
 
-local X_Player  = game:GetService("Players").LocalPlayer
-local X_UIS     = game:GetService("UserInputService")
-local X_Players = game:GetService("Players")
-local X_Http    = game:GetService("HttpService")
-local X_Tween   = game:GetService("TweenService")
-local X_Market  = game:GetService("MarketplaceService")
-local X_Run     = game:GetService("RunService")
+    Changes:
+    - Headless/Korblox now re-enforced in a loop after apply so
+      ApplyDescription can never overwrite them no matter how long it takes
+    - Reset no longer copies face from original items (fixes face bleed on R6)
+    - Reset restores the proper default Roblox face texture instead
+    - Code rewritten in a clean, readable style
+--]]
 
--- ═══════════════════════════════════════════════
--- STATE
--- ═══════════════════════════════════════════════
-local OrigHDesc   = nil   -- HumanoidDescription at launch
-local CurHDesc    = nil   -- last applied HDesc
-local OrigItems   = {}    -- original cosmetics at launch (for manual-mode reset)
-local CurItems    = {}    -- last applied cosmetics (for manual-mode respawn)
-local UseManual   = false -- set true once ApplyDescription fails in this session
-local KorbloxOn   = false
-local HeadlessOn  = false
-local FOVConns    = {}
+-- Services
+local Players         = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local RunService      = game:GetService("RunService")
+local HttpService     = game:GetService("HttpService")
 
-local History, ItemHistory, Favorites = {}, {}, {}
-local SavedOutfits = {}  -- memory only: [name] = {hDesc=?, items=?}
+local LocalPlayer = Players.LocalPlayer
 
--- ═══════════════════════════════════════════════
--- PERSISTENCE
--- ═══════════════════════════════════════════════
-local FNAME = "AvatarChangerV97.json"
-local function SaveData()
+-- Default Roblox face texture (used on reset)
+local DEFAULT_FACE = "rbxasset://textures/face.png"
+
+-- Session state
+local originalHDesc  = nil   -- HumanoidDescription captured at load
+local currentHDesc   = nil   -- last applied HumanoidDescription
+local originalItems  = {}    -- cosmetics captured at load (manual mode fallback)
+local currentItems   = {}    -- last applied items (for respawn re-apply)
+local useManualMode  = false -- becomes true if ApplyDescription is blocked
+local korbloxEnabled = false
+local headlessEnabled = false
+local fovConnections = {}
+
+-- Persistent data (saved outfits stay in memory only — HDesc isn't serialisable)
+local avatarHistory  = {}
+local itemHistory    = {}
+local favorites      = {}
+local savedOutfits   = {}  -- [name] = { hDesc = ..., items = ... }
+
+-- ============================================================
+-- File persistence
+-- ============================================================
+
+local SAVE_FILE = "AvatarChangerV98.json"
+
+local function saveData()
     pcall(function()
         if writefile then
-            writefile(FNAME, X_Http:JSONEncode({
-                H=History, IH=ItemHistory, F=Favorites
-            }))
+            local data = {
+                H  = avatarHistory,
+                IH = itemHistory,
+                F  = favorites,
+            }
+            writefile(SAVE_FILE, HttpService:JSONEncode(data))
         end
     end)
 end
-local function LoadData()
+
+local function loadData()
     pcall(function()
-        if isfile and isfile(FNAME) then
-            local ok,r = pcall(function() return X_Http:JSONDecode(readfile(FNAME)) end)
-            if ok and r then
-                History     = r.H  or {}
-                ItemHistory = r.IH or {}
-                Favorites   = r.F  or {}
+        if isfile and isfile(SAVE_FILE) then
+            local ok, result = pcall(function()
+                return HttpService:JSONDecode(readfile(SAVE_FILE))
+            end)
+            if ok and result then
+                avatarHistory = result.H  or {}
+                itemHistory   = result.IH or {}
+                favorites     = result.F  or {}
             end
         end
     end)
 end
-LoadData()
 
--- ═══════════════════════════════════════════════
--- TWEENS
--- ═══════════════════════════════════════════════
-local function TW(o,g,t,s,d)
-    local tw=X_Tween:Create(o,
-        TweenInfo.new(t or .2,s or Enum.EasingStyle.Quart,d or Enum.EasingDirection.Out),g)
-    tw:Play(); return tw
-end
-local function TWBack(o,g,t)
-    X_Tween:Create(o,
-        TweenInfo.new(t or .34,Enum.EasingStyle.Back,Enum.EasingDirection.Out),g):Play()
+loadData()
+
+-- ============================================================
+-- Tween helpers
+-- ============================================================
+
+local function tween(obj, props, duration, style, direction)
+    local info = TweenInfo.new(
+        duration   or 0.2,
+        style      or Enum.EasingStyle.Quart,
+        direction  or Enum.EasingDirection.Out
+    )
+    local t = TweenService:Create(obj, info, props)
+    t:Play()
+    return t
 end
 
--- ═══════════════════════════════════════════════
--- COLORS
--- ═══════════════════════════════════════════════
-local C={
-    WIN=Color3.fromRGB(10,10,10), PANEL=Color3.fromRGB(18,18,18),
-    CARD=Color3.fromRGB(26,26,26), CHOV=Color3.fromRGB(36,36,36),
-    INPUT=Color3.fromRGB(20,20,20), DIV=Color3.fromRGB(42,42,42),
-    TXT=Color3.fromRGB(245,245,245), SUB=Color3.fromRGB(112,112,112),
-    STR=Color3.fromRGB(48,48,48), STRHI=Color3.fromRGB(188,188,188),
-    WHITE=Color3.fromRGB(236,236,236),
-    BPRI=Color3.fromRGB(232,232,232), BSEC=Color3.fromRGB(30,30,30),
-    BDNG=Color3.fromRGB(52,20,20), BSAV=Color3.fromRGB(18,36,20),
-    BFAV=Color3.fromRGB(40,32,12), BTOG=Color3.fromRGB(44,44,44),
-    NOK=Color3.fromRGB(168,168,168), NERR=Color3.fromRGB(210,65,65),
-    NSAV=Color3.fromRGB(75,188,95), NFAV=Color3.fromRGB(208,155,45),
+local function tweenBack(obj, props, duration)
+    local info = TweenInfo.new(
+        duration or 0.34,
+        Enum.EasingStyle.Back,
+        Enum.EasingDirection.Out
+    )
+    TweenService:Create(obj, info, props):Play()
+end
+
+-- ============================================================
+-- Color palette
+-- ============================================================
+
+local Colors = {
+    background   = Color3.fromRGB(10,  10,  10),
+    panel        = Color3.fromRGB(18,  18,  18),
+    card         = Color3.fromRGB(26,  26,  26),
+    cardHover    = Color3.fromRGB(36,  36,  36),
+    input        = Color3.fromRGB(20,  20,  20),
+    divider      = Color3.fromRGB(42,  42,  42),
+    text         = Color3.fromRGB(245, 245, 245),
+    subtext      = Color3.fromRGB(112, 112, 112),
+    stroke       = Color3.fromRGB(48,  48,  48),
+    strokeHi     = Color3.fromRGB(188, 188, 188),
+    white        = Color3.fromRGB(236, 236, 236),
+    btnPrimary   = Color3.fromRGB(232, 232, 232),
+    btnSecondary = Color3.fromRGB(30,  30,  30),
+    btnDanger    = Color3.fromRGB(52,  20,  20),
+    btnSave      = Color3.fromRGB(18,  36,  20),
+    btnFav       = Color3.fromRGB(40,  32,  12),
+    btnToggle    = Color3.fromRGB(44,  44,  44),
+    notifyOk     = Color3.fromRGB(168, 168, 168),
+    notifyErr    = Color3.fromRGB(210, 65,  65),
+    notifySave   = Color3.fromRGB(75,  188, 95),
+    notifyFav    = Color3.fromRGB(208, 155, 45),
 }
 
--- ═══════════════════════════════════════════════
--- NOTIFICATIONS
--- ═══════════════════════════════════════════════
-local NGui=Instance.new("ScreenGui",X_Player.PlayerGui)
-NGui.Name="X_NGuiV97"; NGui.ResetOnSpawn=false; NGui.DisplayOrder=99
-local nQ,nBusy={},false
-local function Pump()
-    if nBusy or #nQ==0 then return end
-    nBusy=true
-    local msg,clr=table.unpack(table.remove(nQ,1)); clr=clr or C.NOK
-    local bg=Instance.new("Frame",NGui)
-    bg.Size=UDim2.new(0,228,0,40); bg.Position=UDim2.new(1,16,1,-60)
-    bg.BackgroundColor3=Color3.fromRGB(14,14,14); bg.BorderSizePixel=0; bg.ZIndex=20
-    Instance.new("UICorner",bg).CornerRadius=UDim.new(0,10)
-    local sk=Instance.new("UIStroke",bg); sk.Color=clr; sk.Thickness=1.2
-    local bar=Instance.new("Frame",bg)
-    bar.Size=UDim2.new(0,3,1,-10); bar.Position=UDim2.new(0,7,0,5)
-    bar.BackgroundColor3=clr; bar.BorderSizePixel=0
-    Instance.new("UICorner",bar).CornerRadius=UDim.new(1,0)
-    local lbl=Instance.new("TextLabel",bg)
-    lbl.Size=UDim2.new(1,-22,1,0); lbl.Position=UDim2.new(0,18,0,0)
-    lbl.Text=msg; lbl.TextColor3=C.TXT; lbl.BackgroundTransparency=1
-    lbl.Font=Enum.Font.GothamBold; lbl.TextSize=11
-    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=21
-    bg:TweenPosition(UDim2.new(1,-246,1,-60),"Out","Back",.32,true)
-    task.delay(2.6,function()
-        TW(bg,{Position=UDim2.new(1,16,1,-60)},.24)
-        task.delay(.26,function() bg:Destroy(); nBusy=false; Pump() end)
+-- ============================================================
+-- Notification queue
+-- ============================================================
+
+local notifyGui = Instance.new("ScreenGui", LocalPlayer.PlayerGui)
+notifyGui.Name = "AvatarChangerNotifs"
+notifyGui.ResetOnSpawn = false
+notifyGui.DisplayOrder = 99
+
+local notifyQueue = {}
+local notifyBusy  = false
+
+local function pumpNotify()
+    if notifyBusy or #notifyQueue == 0 then return end
+    notifyBusy = true
+
+    local msg, color = table.unpack(table.remove(notifyQueue, 1))
+    color = color or Colors.notifyOk
+
+    local frame = Instance.new("Frame", notifyGui)
+    frame.Size = UDim2.new(0, 228, 0, 40)
+    frame.Position = UDim2.new(1, 16, 1, -60)
+    frame.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+    frame.BorderSizePixel = 0
+    frame.ZIndex = 20
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = color
+    stroke.Thickness = 1.2
+
+    local bar = Instance.new("Frame", frame)
+    bar.Size = UDim2.new(0, 3, 1, -10)
+    bar.Position = UDim2.new(0, 7, 0, 5)
+    bar.BackgroundColor3 = color
+    bar.BorderSizePixel = 0
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1, 0)
+
+    local label = Instance.new("TextLabel", frame)
+    label.Size = UDim2.new(1, -22, 1, 0)
+    label.Position = UDim2.new(0, 18, 0, 0)
+    label.Text = msg
+    label.TextColor3 = Colors.text
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.ZIndex = 21
+
+    frame:TweenPosition(UDim2.new(1, -246, 1, -60), "Out", "Back", 0.32, true)
+
+    task.delay(2.6, function()
+        tween(frame, { Position = UDim2.new(1, 16, 1, -60) }, 0.24)
+        task.delay(0.26, function()
+            frame:Destroy()
+            notifyBusy = false
+            pumpNotify()
+        end)
     end)
 end
-local function Notify(msg,clr) table.insert(nQ,{msg,clr}); Pump() end
 
--- ═══════════════════════════════════════════════
--- RIG DETECTION
--- ═══════════════════════════════════════════════
-local function Rig(char)
-    if char:FindFirstChild("UpperTorso") then return "R15" end
-    return "R6"
+local function notify(msg, color)
+    table.insert(notifyQueue, { msg, color })
+    pumpNotify()
 end
 
--- ═══════════════════════════════════════════════
--- WELD ACCESSORY
--- ═══════════════════════════════════════════════
-local function WeldAcc(acc, char)
-    local h=acc:FindFirstChild("Handle"); if not char or not h then return end
-    local att=h:FindFirstChildOfClass("Attachment")
-    local tar=att and char:FindFirstChild(att.Name,true)
-    acc.Parent=char
-    if tar then
-        local w=Instance.new("Weld",h)
-        w.Part0=h; w.Part1=tar.Parent
-        w.C0=att.CFrame; w.C1=tar.CFrame
+-- ============================================================
+-- Rig detection
+-- ============================================================
+
+local function getRig(char)
+    return char:FindFirstChild("UpperTorso") and "R15" or "R6"
+end
+
+-- ============================================================
+-- Accessory welding
+-- ============================================================
+
+local function weldAccessory(acc, char)
+    local handle = acc:FindFirstChild("Handle")
+    if not char or not handle then return end
+
+    local attachment = handle:FindFirstChildOfClass("Attachment")
+    local target = attachment and char:FindFirstChild(attachment.Name, true)
+
+    acc.Parent = char
+
+    if target then
+        local weld = Instance.new("Weld", handle)
+        weld.Part0 = handle
+        weld.Part1 = target.Parent
+        weld.C0 = attachment.CFrame
+        weld.C1 = target.CFrame
     end
 end
 
--- ═══════════════════════════════════════════════
--- FOV FIX
--- ═══════════════════════════════════════════════
-local function ApplyFOV(char,hide)
+-- ============================================================
+-- First-person (FOV) arm hide fix
+-- ============================================================
+
+local function applyFOVHide(char, hide)
     if not char then return end
-    for _,n in ipairs({"Right Arm","Left Arm","RightUpperArm","RightLowerArm",
-                        "RightHand","LeftUpperArm","LeftLowerArm","LeftHand"}) do
-        local p=char:FindFirstChild(n)
-        if p and p:IsA("BasePart") then
-            if not p:FindFirstChild("_OT") then
-                local v=Instance.new("NumberValue",p); v.Name="_OT"; v.Value=p.Transparency
+
+    local armParts = {
+        "Right Arm", "Left Arm",
+        "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperArm",  "LeftLowerArm",  "LeftHand",
+    }
+
+    for _, name in ipairs(armParts) do
+        local part = char:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            -- Cache the original transparency the first time
+            if not part:FindFirstChild("_origTransp") then
+                local v = Instance.new("NumberValue", part)
+                v.Name = "_origTransp"
+                v.Value = part.Transparency
             end
-            p.Transparency=hide and 1 or (p:FindFirstChild("_OT") and p._OT.Value or 0)
+            local orig = part:FindFirstChild("_origTransp")
+            part.Transparency = hide and 1 or (orig and orig.Value or 0)
         end
     end
-    for _,v in pairs(char:GetChildren()) do
-        if v:IsA("Accessory") then
-            local hdl=v:FindFirstChild("Handle")
-            if hdl then hdl.LocalTransparencyModifier=0 end
+
+    -- Keep accessories visible in first-person
+    for _, child in pairs(char:GetChildren()) do
+        if child:IsA("Accessory") then
+            local handle = child:FindFirstChild("Handle")
+            if handle then
+                handle.LocalTransparencyModifier = 0
+            end
         end
     end
 end
 
-local function StartFOV()
-    for _,c in pairs(FOVConns) do c:Disconnect() end; FOVConns={}
-    local cam=workspace.CurrentCamera; local last=nil
-    table.insert(FOVConns, X_Run.RenderStepped:Connect(function()
-        local char=X_Player.Character; if not char then return end
-        cam=workspace.CurrentCamera
-        local head=char:FindFirstChild("Head"); if not head then return end
-        local inFOV=(cam.CFrame.Position-head.Position).Magnitude<1.2
-        if inFOV~=last then last=inFOV; ApplyFOV(char,inFOV) end
-    end))
+local function startFOVFix()
+    for _, conn in pairs(fovConnections) do conn:Disconnect() end
+    fovConnections = {}
+
+    local lastState = nil
+
+    local conn = RunService.RenderStepped:Connect(function()
+        local char = LocalPlayer.Character
+        if not char then return end
+
+        local head = char:FindFirstChild("Head")
+        if not head then return end
+
+        local cam = workspace.CurrentCamera
+        local inFirstPerson = (cam.CFrame.Position - head.Position).Magnitude < 1.2
+
+        if inFirstPerson ~= lastState then
+            lastState = inFirstPerson
+            applyFOVHide(char, inFirstPerson)
+        end
+    end)
+
+    table.insert(fovConnections, conn)
 end
 
--- ═══════════════════════════════════════════════
--- KORBLOX
--- ═══════════════════════════════════════════════
-local function DoKorblox(on)
-    local char=X_Player.Character; if not char then return end
-    for _,v in pairs(char:GetChildren()) do if v.Name=="VKB" then v:Destroy() end end
-    if on then
-        local p=Instance.new("Part",char); p.Name="VKB"
-        p.Size=Vector3.new(1,2,1); p.CanCollide=false
-        local m=Instance.new("SpecialMesh",p)
-        m.MeshId="rbxassetid://902942096"; m.TextureId="rbxassetid://902843398"
-        m.Scale=Vector3.new(1.2,1.2,1.2)
-        local leg=char:FindFirstChild("RightUpperLeg") or char:FindFirstChild("Right Leg")
+-- ============================================================
+-- Korblox visual
+-- ============================================================
+
+local function applyKorblox(enabled)
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    -- Remove existing korblox part
+    for _, v in pairs(char:GetChildren()) do
+        if v.Name == "_KorbloxPart" then v:Destroy() end
+    end
+
+    if enabled then
+        local part = Instance.new("Part", char)
+        part.Name = "_KorbloxPart"
+        part.Size = Vector3.new(1, 2, 1)
+        part.CanCollide = false
+
+        local mesh = Instance.new("SpecialMesh", part)
+        mesh.MeshId    = "rbxassetid://902942096"
+        mesh.TextureId = "rbxassetid://902843398"
+        mesh.Scale     = Vector3.new(1.2, 1.2, 1.2)
+
+        local leg = char:FindFirstChild("RightUpperLeg") or char:FindFirstChild("Right Leg")
         if leg then
-            local w=Instance.new("Weld",p); w.Part0=leg; w.Part1=p
-            w.C0=(leg.Name=="Right Leg") and CFrame.new(0,.6,-.1) or CFrame.new(0,.15,0)
+            local weld = Instance.new("Weld", part)
+            weld.Part0 = leg
+            weld.Part1 = part
+            weld.C0 = (leg.Name == "Right Leg")
+                and CFrame.new(0, 0.6, -0.1)
+                or  CFrame.new(0, 0.15, 0)
         end
-        for _,n in ipairs({"RightUpperLeg","RightLowerLeg","RightFoot","Right Leg"}) do
-            local pt=char:FindFirstChild(n); if pt then pt.Transparency=1 end
+
+        -- Hide the real leg parts
+        for _, name in ipairs({ "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" }) do
+            local p = char:FindFirstChild(name)
+            if p then p.Transparency = 1 end
         end
     else
-        for _,n in ipairs({"RightUpperLeg","RightLowerLeg","RightFoot","Right Leg"}) do
-            local pt=char:FindFirstChild(n); if pt then pt.Transparency=0 end
+        -- Show them again
+        for _, name in ipairs({ "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" }) do
+            local p = char:FindFirstChild(name)
+            if p then p.Transparency = 0 end
         end
     end
 end
 
--- ═══════════════════════════════════════════════════════════════
--- MANUAL APPLY  — used when ApplyDescription is blocked by game
--- Clones cosmetics from the source model and applies to character
--- Works on any rig (R6 or R15) without touching body parts
--- ═══════════════════════════════════════════════════════════════
-local function ManualApply(items, char, isReset)
+-- ============================================================
+-- Headless visual
+-- Runs in a short loop to fight ApplyDescription overwriting it
+-- ============================================================
+
+local function enforceHeadless(char, enabled)
+    local head = char and char:FindFirstChild("Head")
+    if not head then return end
+
+    -- Loop a few times over ~0.5s to beat ApplyDescription's async completion
+    task.spawn(function()
+        for _ = 1, 8 do
+            task.wait(0.07)
+            local c = LocalPlayer.Character
+            if not c then break end
+            local h = c:FindFirstChild("Head")
+            if not h then break end
+            h.Transparency = enabled and 1 or 0
+            for _, child in pairs(h:GetChildren()) do
+                if child:IsA("Decal") then
+                    child.Transparency = enabled and 1 or 0
+                end
+            end
+        end
+    end)
+end
+
+-- Same looping approach for korblox leg hides
+local function enforceKorblox(char, enabled)
+    task.spawn(function()
+        for _ = 1, 8 do
+            task.wait(0.07)
+            local c = LocalPlayer.Character
+            if not c then break end
+            -- Re-run the hide/show on legs
+            for _, name in ipairs({ "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg" }) do
+                local p = c:FindFirstChild(name)
+                if p then p.Transparency = enabled and 1 or 0 end
+            end
+        end
+    end)
+end
+
+-- ============================================================
+-- Manual cosmetic apply (fallback when ApplyDescription blocked)
+-- ============================================================
+
+local function applyItemsToChar(items, char, isReset)
     if not char then return end
-    local rig = Rig(char)
+
+    local rig  = getRig(char)
     local head = char:FindFirstChild("Head")
 
-    -- 1. Remove existing cosmetics (leave body parts intact)
-    for _,v in pairs(char:GetChildren()) do
-        if v:IsA("Accessory") or v:IsA("Shirt") or v:IsA("Pants")
-        or v:IsA("ShirtGraphic") or v:IsA("BodyColors") or v:IsA("CharacterMesh") then
+    -- Strip existing cosmetics
+    for _, v in pairs(char:GetChildren()) do
+        if v:IsA("Accessory")
+        or v:IsA("Shirt") or v:IsA("Pants") or v:IsA("ShirtGraphic")
+        or v:IsA("BodyColors") or v:IsA("CharacterMesh") then
             v:Destroy()
         end
     end
 
-    -- 2. Clean head face/mesh
+    -- Reset head
     if head then
         head.Transparency = 0
-        for _,v in pairs(head:GetChildren()) do
-            if v:IsA("Decal") or (v:IsA("SpecialMesh") and rig=="R15") then
+
+        -- Remove face decal and (on R15) any injected mesh
+        for _, v in pairs(head:GetChildren()) do
+            if v:IsA("Decal") or (v:IsA("SpecialMesh") and rig == "R15") then
                 v:Destroy()
             end
         end
-        -- R6 reset: restore default round head mesh
-        if rig=="R6" and isReset then
-            local existing=head:FindFirstChildOfClass("SpecialMesh")
-            if not existing then
-                local m=Instance.new("SpecialMesh",head)
-                m.MeshType=Enum.MeshType.Head; m.Scale=Vector3.new(1.25,1.25,1.25)
-            end
-        end
-    end
 
-    -- 3. Apply each item
-    for _,item in pairs(items) do
-        local cls=item.ClassName
-        if cls=="Accessory" then
-            WeldAcc(item:Clone(), char)
-        elseif cls=="Shirt" or cls=="Pants" or cls=="ShirtGraphic" then
-            item:Clone().Parent=char
-        elseif cls=="BodyColors" then
-            item:Clone().Parent=char
-        elseif cls=="CharacterMesh" then
-            if rig=="R6" then item:Clone().Parent=char end
-        elseif cls=="SpecialMesh" then
-            -- Only apply to head on R6 (R15 uses rig mesh system)
-            if head and rig=="R6" and not isReset then
-                -- Remove existing first
-                local ex=head:FindFirstChildOfClass("SpecialMesh")
-                if ex then ex:Destroy() end
-                item:Clone().Parent=head
-            end
-        elseif cls=="Decal" and item.Name=="face" then
-            if head then
-                -- Skip default Roblox face textures
-                local tex=item.Texture
-                local isDef=(tex=="rbxasset://textures/face.png"
-                          or tex=="rbxassetid://0" or tex=="")
-                if not isDef then
-                    local ex=head:FindFirstChild("face")
-                    if ex then ex:Destroy() end
-                    item:Clone().Parent=head
+        if isReset then
+            -- Restore default face — never copy face from captured items on reset
+            local face = Instance.new("Decal", head)
+            face.Name    = "face"
+            face.Texture = DEFAULT_FACE
+
+            -- R6 needs a SpecialMesh for the round head shape
+            if rig == "R6" then
+                local existing = head:FindFirstChildOfClass("SpecialMesh")
+                if not existing then
+                    local m = Instance.new("SpecialMesh", head)
+                    m.MeshType = Enum.MeshType.Head
+                    m.Scale    = Vector3.new(1.25, 1.25, 1.25)
                 end
             end
         end
     end
 
-    -- 4. Restore all body part visibility (reset may have hidden some)
-    for _,v in pairs(char:GetDescendants()) do
-        if v:IsA("BasePart") and v.Name~="HumanoidRootPart" and v.Name~="Head" then
-            v.Transparency=0
+    -- Apply items from the list
+    for _, item in pairs(items) do
+        local cls = item.ClassName
+
+        if cls == "Accessory" then
+            weldAccessory(item:Clone(), char)
+
+        elseif cls == "Shirt" or cls == "Pants" or cls == "ShirtGraphic" then
+            item:Clone().Parent = char
+
+        elseif cls == "BodyColors" then
+            item:Clone().Parent = char
+
+        elseif cls == "CharacterMesh" then
+            -- R6 only — CharacterMesh on R15 causes invisible body parts
+            if rig == "R6" then
+                item:Clone().Parent = char
+            end
+
+        elseif cls == "SpecialMesh" then
+            -- Only inject head mesh on R6 (R15 rig system handles head shape)
+            if head and rig == "R6" and not isReset then
+                local ex = head:FindFirstChildOfClass("SpecialMesh")
+                if ex then ex:Destroy() end
+                item:Clone().Parent = head
+            end
+
+        elseif cls == "Decal" and item.Name == "face" then
+            -- Skip on reset (we already set the default face above)
+            if not isReset and head then
+                local tex = item.Texture
+                local isDefaultTex = (
+                    tex == DEFAULT_FACE
+                    or tex == "rbxassetid://0"
+                    or tex == ""
+                )
+                if not isDefaultTex then
+                    local ex = head:FindFirstChild("face")
+                    if ex then ex:Destroy() end
+                    item:Clone().Parent = head
+                end
+            end
+        end
+    end
+
+    -- Make sure body parts are all visible
+    for _, v in pairs(char:GetDescendants()) do
+        if v:IsA("BasePart")
+        and v.Name ~= "HumanoidRootPart"
+        and v.Name ~= "Head" then
+            v.Transparency = 0
         end
     end
 end
 
--- ═══════════════════════════════════════════════════════════════
--- BUILD ITEM LIST FROM USER MODEL
--- ═══════════════════════════════════════════════════════════════
-local function BuildItemsFromModel(uid)
-    local ok,model=pcall(function()
-        return X_Players:CreateHumanoidModelFromUserId(uid)
+-- ============================================================
+-- Build cosmetic item list from a user's model
+-- ============================================================
+
+local function buildItemList(userId)
+    local ok, model = pcall(function()
+        return Players:CreateHumanoidModelFromUserId(userId)
     end)
     if not ok or not model then return nil end
 
-    local items={}
-    for _,v in pairs(model:GetDescendants()) do
-        local cls=v.ClassName
-        if cls=="Accessory" or cls=="Shirt" or cls=="Pants" or cls=="ShirtGraphic"
-        or cls=="BodyColors" or cls=="CharacterMesh" then
+    local items = {}
+    for _, v in pairs(model:GetDescendants()) do
+        local cls = v.ClassName
+        if cls == "Accessory"
+        or cls == "Shirt" or cls == "Pants" or cls == "ShirtGraphic"
+        or cls == "BodyColors" or cls == "CharacterMesh" then
             table.insert(items, v:Clone())
-        elseif cls=="Decal" and v.Name=="face" then
+        elseif cls == "Decal" and v.Name == "face" then
             table.insert(items, v:Clone())
-        elseif cls=="SpecialMesh" and v.Parent and v.Parent.Name=="Head" then
+        elseif cls == "SpecialMesh" and v.Parent and v.Parent.Name == "Head" then
             table.insert(items, v:Clone())
         end
     end
+
     model:Destroy()
     return items
 end
 
--- ═══════════════════════════════════════════════════════════════
--- POST-APPLY EFFECTS (headless, korblox, fov)
--- ═══════════════════════════════════════════════════════════════
-local function PostApply()
-    task.spawn(function()
-        task.wait(0.06)
-        local char=X_Player.Character; if not char then return end
-        local head=char:FindFirstChild("Head")
-        if head then
-            head.Transparency=HeadlessOn and 1 or 0
-            for _,v in pairs(head:GetChildren()) do
-                if v:IsA("Decal") then v.Transparency=HeadlessOn and 1 or 0 end
-            end
-        end
-        DoKorblox(KorbloxOn)
-        StartFOV()
-    end)
-end
+-- ============================================================
+-- Core avatar apply
+-- Tries ApplyDescription first; falls back to manual if blocked
+-- ============================================================
 
--- ═══════════════════════════════════════════════════════════════
--- CORE APPLY  — tries ApplyDescription first, falls back to manual
--- ═══════════════════════════════════════════════════════════════
-local function ApplyAvatar(hDesc, items, isReset)
-    local char=X_Player.Character; if not char then return end
-    local hum=char:FindFirstChildOfClass("Humanoid"); if not hum then return end
+local function applyAvatar(hDesc, items, isReset)
+    local char = LocalPlayer.Character
+    if not char then return end
 
-    local applied=false
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
 
-    -- Try ApplyDescription (fastest, most complete)
-    if not UseManual and hDesc then
-        local ok=pcall(function() hum:ApplyDescription(hDesc) end)
+    local usedApplyDesc = false
+
+    if not useManualMode and hDesc then
+        local ok = pcall(function() hum:ApplyDescription(hDesc) end)
         if ok then
-            applied=true
-            CurHDesc=hDesc
+            usedApplyDesc = true
+            currentHDesc  = hDesc
         else
-            -- Game blocks ApplyDescription — switch to manual mode permanently
-            UseManual=true
-            Notify("Game blocked ApplyDesc, using manual mode", C.NFAV)
+            useManualMode = true
+            notify("Auto-switched to manual mode", Colors.notifyFav)
         end
     end
 
-    -- Fallback: manual item-by-item application
-    if not applied then
+    if not usedApplyDesc then
         if not items then
-            Notify("No item data available", C.NERR); return
+            notify("No avatar data available", Colors.notifyErr)
+            return
         end
-        ManualApply(items, char, isReset)
-        CurItems=items
+        applyItemsToChar(items, char, isReset)
+        currentItems = items
     end
 
-    PostApply()
-    Notify(isReset and "Avatar Reset" or "Avatar Applied",
-           isReset and C.NERR or C.NOK)
+    -- Enforce headless and korblox in a loop so ApplyDescription
+    -- can't overwrite the transparency changes after we set them
+    if headlessEnabled then
+        enforceHeadless(char, true)
+    end
+    if korbloxEnabled then
+        applyKorblox(true)
+        enforceKorblox(char, true)
+    end
+
+    task.spawn(startFOVFix)
+    notify(isReset and "Avatar Reset" or "Avatar Applied",
+           isReset and Colors.notifyErr or Colors.notifyOk)
 end
 
--- ═══════════════════════════════════════════════
--- CHANGE AVATAR
--- ═══════════════════════════════════════════════
-local function ChangeAvatar(input)
-    input=tostring(input):match("^%s*(.-)%s*$")
-    if input=="" then Notify("Enter a username or ID", C.NERR); return end
+-- ============================================================
+-- Change avatar by username or user ID
+-- ============================================================
 
-    -- Resolve userId
-    local uid
-    local ok1,res1=pcall(function() return X_Players:GetUserIdFromNameAsync(input) end)
-    if ok1 and res1 then uid=res1
-    else
-        local n=tonumber(input:match("^%d+$"))
-        if n then uid=n else Notify("User not found", C.NERR); return end
+local function changeAvatar(input)
+    input = tostring(input):match("^%s*(.-)%s*$")
+    if input == "" then
+        notify("Enter a username or ID", Colors.notifyErr)
+        return
     end
 
-    -- Deduplicate & push to history
-    for i,e in ipairs(History) do
-        if (type(e)=="table" and e.name==input) or e==input then
-            table.remove(History,i); break
+    -- Resolve to a userId
+    local userId
+    local ok, result = pcall(function()
+        return Players:GetUserIdFromNameAsync(input)
+    end)
+    if ok and result then
+        userId = result
+    else
+        local numericId = tonumber(input:match("^%d+$"))
+        if numericId then
+            userId = numericId
+        else
+            notify("User not found", Colors.notifyErr)
+            return
         end
     end
-    table.insert(History,1,{name=input, time=os.time()})
-    if #History>30 then table.remove(History) end
-    SaveData()
 
-    -- Fetch HumanoidDescription
+    -- Push to history (deduplicated, most recent first)
+    for i, entry in ipairs(avatarHistory) do
+        local name = type(entry) == "table" and entry.name or tostring(entry)
+        if name == input then
+            table.remove(avatarHistory, i)
+            break
+        end
+    end
+    table.insert(avatarHistory, 1, { name = input, time = os.time() })
+    if #avatarHistory > 30 then table.remove(avatarHistory) end
+    saveData()
+
+    -- Fetch the HumanoidDescription and item list in parallel
     local hDesc
-    pcall(function() hDesc=X_Players:GetHumanoidDescriptionFromUserId(uid) end)
+    pcall(function()
+        hDesc = Players:GetHumanoidDescriptionFromUserId(userId)
+    end)
 
-    -- Also build manual item list as fallback (always fetch, cheap)
-    local items=BuildItemsFromModel(uid)
+    local items = buildItemList(userId)
 
     if not hDesc and not items then
-        Notify("Could not fetch avatar", C.NERR); return
+        notify("Could not fetch avatar data", Colors.notifyErr)
+        return
     end
 
-    ApplyAvatar(hDesc, items, false)
+    applyAvatar(hDesc, items, false)
 end
 
--- ═══════════════════════════════════════════════
--- WEAR SINGLE ITEM
--- ═══════════════════════════════════════════════
-local function GetTemplate(id)
-    local ok,a=pcall(function() return game:GetObjects("rbxassetid://"..id)[1] end)
-    if ok and a then
-        local t=""
-        if a:IsA("Shirt") then t=a.ShirtTemplate
-        elseif a:IsA("Pants") then t=a.PantsTemplate
-        elseif a:IsA("ShirtGraphic") then t=a.Graphic end
-        a:Destroy(); return t~="" and t or ("rbxassetid://"..id)
+-- ============================================================
+-- Wear a single item by ID
+-- ============================================================
+
+local function getClothingTemplate(id)
+    local ok, asset = pcall(function()
+        return game:GetObjects("rbxassetid://" .. id)[1]
+    end)
+    if ok and asset then
+        local template = ""
+        if asset:IsA("Shirt") then
+            template = asset.ShirtTemplate
+        elseif asset:IsA("Pants") then
+            template = asset.PantsTemplate
+        elseif asset:IsA("ShirtGraphic") then
+            template = asset.Graphic
+        end
+        asset:Destroy()
+        return template ~= "" and template or ("rbxassetid://" .. id)
     end
-    return "rbxassetid://"..id
+    return "rbxassetid://" .. id
 end
 
-local function WearSingleItem(id)
-    local char=X_Player.Character; if not char then return false end
-    local ok,info=pcall(function() return X_Market:GetProductInfo(tonumber(id)) end)
+local function wearItem(id)
+    local char = LocalPlayer.Character
+    if not char then return false end
+
+    local ok, info = pcall(function()
+        return MarketplaceService:GetProductInfo(tonumber(id))
+    end)
+
     if ok and info then
-        if info.AssetTypeId==11 then
-            local s=char:FindFirstChildOfClass("Shirt") or Instance.new("Shirt",char)
-            s.ShirtTemplate=GetTemplate(id); Notify("Shirt Applied",C.NOK); return true
-        elseif info.AssetTypeId==12 then
-            local p=char:FindFirstChildOfClass("Pants") or Instance.new("Pants",char)
-            p.PantsTemplate=GetTemplate(id); Notify("Pants Applied",C.NOK); return true
+        if info.AssetTypeId == 11 then
+            local shirt = char:FindFirstChildOfClass("Shirt")
+                       or Instance.new("Shirt", char)
+            shirt.ShirtTemplate = getClothingTemplate(id)
+            notify("Shirt Applied", Colors.notifyOk)
+            return true
+        elseif info.AssetTypeId == 12 then
+            local pants = char:FindFirstChildOfClass("Pants")
+                       or Instance.new("Pants", char)
+            pants.PantsTemplate = getClothingTemplate(id)
+            notify("Pants Applied", Colors.notifyOk)
+            return true
         end
     end
-    local ok2,asset=pcall(function() return game:GetObjects("rbxassetid://"..id)[1] end)
+
+    local ok2, asset = pcall(function()
+        return game:GetObjects("rbxassetid://" .. id)[1]
+    end)
     if ok2 and asset then
-        if asset:IsA("Accessory") then WeldAcc(asset,char) else asset.Parent=char end
-        Notify("Item Added",C.NOK); return true
+        if asset:IsA("Accessory") then
+            weldAccessory(asset, char)
+        else
+            asset.Parent = char
+        end
+        notify("Item Added", Colors.notifyOk)
+        return true
     end
+
     return false
 end
 
--- ═══════════════════════════════════════════════
--- INJECT BODY / FACE / HEAD
--- ═══════════════════════════════════════════════
-local function InjectPart(id)
-    local char=X_Player.Character; if not char then return false end
-    local cid=tostring(id):match("%d+"); if not cid then return false end
-    local head=char:FindFirstChild("Head")
-    local ok,info=pcall(function() return X_Market:GetProductInfo(tonumber(cid)) end)
+-- ============================================================
+-- Inject face / head mesh / body part by ID
+-- ============================================================
+
+local function injectPart(id)
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    local cid = tostring(id):match("%d+")
+    if not cid then notify("Invalid ID", Colors.notifyErr); return end
+
+    local head = char:FindFirstChild("Head")
+    local ok, info = pcall(function()
+        return MarketplaceService:GetProductInfo(tonumber(cid))
+    end)
+
     if ok and info then
-        local t=info.AssetTypeId
-        if t==18 then
+        local assetType = info.AssetTypeId
+
+        if assetType == 18 then  -- Face decal
             if head then
-                local f=head:FindFirstChild("face") or Instance.new("Decal",head)
-                f.Name="face"; f.Texture="rbxassetid://"..cid
-                Notify("Face Injected",C.NOK); return true
+                local face = head:FindFirstChild("face") or Instance.new("Decal", head)
+                face.Name    = "face"
+                face.Texture = "rbxassetid://" .. cid
+                notify("Face Injected", Colors.notifyOk)
             end
-        elseif t==17 or t==24 then
+            return
+
+        elseif assetType == 17 or assetType == 24 then  -- Head mesh
             if head then
-                local m=head:FindFirstChildOfClass("SpecialMesh") or Instance.new("SpecialMesh",head)
-                m.MeshId="rbxassetid://"..cid
-                Notify("Head Injected",C.NOK); return true
+                local mesh = head:FindFirstChildOfClass("SpecialMesh")
+                          or Instance.new("SpecialMesh", head)
+                mesh.MeshId = "rbxassetid://" .. cid
+                notify("Head Injected", Colors.notifyOk)
             end
-        elseif t>=27 and t<=31 then
-            local ok2,a=pcall(function() return game:GetObjects("rbxassetid://"..cid)[1] end)
-            if ok2 and a then a.Parent=char; Notify("Body Part Injected",C.NOK); return true end
+            return
+
+        elseif assetType >= 27 and assetType <= 31 then  -- Body part package
+            local ok2, asset = pcall(function()
+                return game:GetObjects("rbxassetid://" .. cid)[1]
+            end)
+            if ok2 and asset then
+                asset.Parent = char
+                notify("Body Part Injected", Colors.notifyOk)
+            end
+            return
         end
     end
-    Notify("ID not recognised",C.NERR); return false
+
+    notify("ID not recognised", Colors.notifyErr)
 end
 
--- ═══════════════════════════════════════════════════════════════
---   U I   —  260 × 490
--- ═══════════════════════════════════════════════════════════════
-local WIN_W,WIN_H=260,490
-local Gui=Instance.new("ScreenGui",X_Player.PlayerGui)
-Gui.Name="AvatarChangerV97"; Gui.ResetOnSpawn=false; Gui.DisplayOrder=10
+-- ============================================================
+--
+--   U I   (260 x 490)
+--
+-- ============================================================
 
-local Main=Instance.new("Frame",Gui)
-Main.Name="Main"; Main.Size=UDim2.new(0,WIN_W,0,WIN_H)
-Main.Position=UDim2.new(.5,-WIN_W/2,.5,-WIN_H/2)
-Main.BackgroundColor3=C.WIN; Main.Active=true
-Main.ClipsDescendants=true; Main.Visible=false
-Instance.new("UICorner",Main).CornerRadius=UDim.new(0,14)
-local wSK=Instance.new("UIStroke",Main); wSK.Color=C.STR; wSK.Thickness=1.3
+local WIN_W = 260
+local WIN_H = 490
 
--- Gradient top line
-local tLine=Instance.new("Frame",Main)
-tLine.Size=UDim2.new(1,0,0,2); tLine.BackgroundColor3=C.WHITE
-tLine.BorderSizePixel=0; tLine.ZIndex=6
-Instance.new("UIGradient",tLine).Color=ColorSequence.new({
-    ColorSequenceKeypoint.new(0,Color3.fromRGB(18,18,18)),
-    ColorSequenceKeypoint.new(.22,C.WHITE),
-    ColorSequenceKeypoint.new(.78,C.WHITE),
-    ColorSequenceKeypoint.new(1,Color3.fromRGB(18,18,18)),
+local screenGui = Instance.new("ScreenGui", LocalPlayer.PlayerGui)
+screenGui.Name          = "AvatarChangerV98"
+screenGui.ResetOnSpawn  = false
+screenGui.DisplayOrder  = 10
+
+-- Main window frame
+local mainFrame = Instance.new("Frame", screenGui)
+mainFrame.Name              = "MainWindow"
+mainFrame.Size              = UDim2.new(0, WIN_W, 0, WIN_H)
+mainFrame.Position          = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2)
+mainFrame.BackgroundColor3  = Colors.background
+mainFrame.Active            = true
+mainFrame.ClipsDescendants  = true
+mainFrame.Visible           = false
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 14)
+local windowStroke = Instance.new("UIStroke", mainFrame)
+windowStroke.Color     = Colors.stroke
+windowStroke.Thickness = 1.3
+
+-- Gradient accent line at top
+local accentLine = Instance.new("Frame", mainFrame)
+accentLine.Size             = UDim2.new(1, 0, 0, 2)
+accentLine.BackgroundColor3 = Colors.white
+accentLine.BorderSizePixel  = 0
+accentLine.ZIndex           = 6
+local gradient = Instance.new("UIGradient", accentLine)
+gradient.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,    Color3.fromRGB(18, 18, 18)),
+    ColorSequenceKeypoint.new(0.22, Colors.white),
+    ColorSequenceKeypoint.new(0.78, Colors.white),
+    ColorSequenceKeypoint.new(1,    Color3.fromRGB(18, 18, 18)),
 })
 
--- Header 46px
-local HDR=Instance.new("Frame",Main)
-HDR.Size=UDim2.new(1,0,0,46); HDR.Position=UDim2.new(0,0,0,2)
-HDR.BackgroundColor3=C.PANEL; HDR.BorderSizePixel=0; HDR.ZIndex=4
-local hDiv=Instance.new("Frame",HDR)
-hDiv.Size=UDim2.new(1,0,0,1); hDiv.Position=UDim2.new(0,0,1,-1)
-hDiv.BackgroundColor3=C.DIV; hDiv.BorderSizePixel=0; hDiv.ZIndex=5
+-- Header bar
+local header = Instance.new("Frame", mainFrame)
+header.Size             = UDim2.new(1, 0, 0, 46)
+header.Position         = UDim2.new(0, 0, 0, 2)
+header.BackgroundColor3 = Colors.panel
+header.BorderSizePixel  = 0
+header.ZIndex           = 4
 
-local TitleL=Instance.new("TextLabel",HDR)
-TitleL.Size=UDim2.new(0,180,0,20); TitleL.Position=UDim2.new(0,13,0,7)
-TitleL.Text="AVATAR CHANGER"; TitleL.TextColor3=C.TXT
-TitleL.Font=Enum.Font.GothamBold; TitleL.TextSize=13
-TitleL.BackgroundTransparency=1
-TitleL.TextXAlignment=Enum.TextXAlignment.Left; TitleL.ZIndex=5
+local headerDivider = Instance.new("Frame", header)
+headerDivider.Size             = UDim2.new(1, 0, 0, 1)
+headerDivider.Position         = UDim2.new(0, 0, 1, -1)
+headerDivider.BackgroundColor3 = Colors.divider
+headerDivider.BorderSizePixel  = 0
+headerDivider.ZIndex           = 5
 
-local VerL=Instance.new("TextLabel",HDR)
-VerL.Size=UDim2.new(0,180,0,12); VerL.Position=UDim2.new(0,13,0,28)
-VerL.Text="V97  ·  by XYTHC"; VerL.TextColor3=C.SUB
-VerL.Font=Enum.Font.Gotham; VerL.TextSize=9
-VerL.BackgroundTransparency=1
-VerL.TextXAlignment=Enum.TextXAlignment.Left; VerL.ZIndex=5
+local titleLabel = Instance.new("TextLabel", header)
+titleLabel.Size               = UDim2.new(0, 180, 0, 20)
+titleLabel.Position           = UDim2.new(0, 13, 0, 7)
+titleLabel.Text               = "AVATAR CHANGER"
+titleLabel.TextColor3         = Colors.text
+titleLabel.Font               = Enum.Font.GothamBold
+titleLabel.TextSize           = 13
+titleLabel.BackgroundTransparency = 1
+titleLabel.TextXAlignment     = Enum.TextXAlignment.Left
+titleLabel.ZIndex             = 5
 
-local CloseBtn=Instance.new("TextButton",HDR)
-CloseBtn.Size=UDim2.new(0,24,0,24); CloseBtn.Position=UDim2.new(1,-34,0,11)
-CloseBtn.BackgroundColor3=Color3.fromRGB(32,32,32); CloseBtn.Text="✕"
-CloseBtn.TextColor3=C.SUB; CloseBtn.Font=Enum.Font.GothamBold
-CloseBtn.TextSize=11; CloseBtn.ZIndex=5
-Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,7)
-CloseBtn.MouseEnter:Connect(function() TW(CloseBtn,{TextColor3=Color3.fromRGB(228,70,70)},.12) end)
-CloseBtn.MouseLeave:Connect(function() TW(CloseBtn,{TextColor3=C.SUB},.12) end)
+local versionLabel = Instance.new("TextLabel", header)
+versionLabel.Size               = UDim2.new(0, 180, 0, 12)
+versionLabel.Position           = UDim2.new(0, 13, 0, 28)
+versionLabel.Text               = "V98  ·  by XYTHC"
+versionLabel.TextColor3         = Colors.subtext
+versionLabel.Font               = Enum.Font.Gotham
+versionLabel.TextSize           = 9
+versionLabel.BackgroundTransparency = 1
+versionLabel.TextXAlignment     = Enum.TextXAlignment.Left
+versionLabel.ZIndex             = 5
 
--- Tab bar 30px
-local TabBar=Instance.new("Frame",Main)
-TabBar.Size=UDim2.new(1,-18,0,30); TabBar.Position=UDim2.new(0,9,0,54)
-TabBar.BackgroundColor3=C.CARD; TabBar.ZIndex=4
-Instance.new("UICorner",TabBar).CornerRadius=UDim.new(0,9)
+local closeButton = Instance.new("TextButton", header)
+closeButton.Size             = UDim2.new(0, 24, 0, 24)
+closeButton.Position         = UDim2.new(1, -34, 0, 11)
+closeButton.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+closeButton.Text             = "✕"
+closeButton.TextColor3       = Colors.subtext
+closeButton.Font             = Enum.Font.GothamBold
+closeButton.TextSize         = 11
+closeButton.ZIndex           = 5
+Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 7)
+closeButton.MouseEnter:Connect(function()
+    tween(closeButton, { TextColor3 = Color3.fromRGB(228, 70, 70) }, 0.12)
+end)
+closeButton.MouseLeave:Connect(function()
+    tween(closeButton, { TextColor3 = Colors.subtext }, 0.12)
+end)
 
-local function MkTab(txt,xs,active)
-    local b=Instance.new("TextButton",TabBar)
-    b.Size=UDim2.new(.5,-4,1,-6)
-    b.Position=UDim2.new(xs, xs==0 and 3 or 1, 0, 3)
-    b.BackgroundColor3=active and C.WHITE or Color3.fromRGB(0,0,0)
-    b.BackgroundTransparency=active and 0 or 1
-    b.Text=txt; b.Font=Enum.Font.GothamBold; b.TextSize=10; b.ZIndex=5
-    b.TextColor3=active and C.WIN or C.SUB
-    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
-    return b
-end
-local TAB_C=MkTab("CHANGER",0,true)
-local TAB_H=MkTab("HISTORY",.5,false)
+-- Tab bar
+local tabBar = Instance.new("Frame", mainFrame)
+tabBar.Size             = UDim2.new(1, -18, 0, 30)
+tabBar.Position         = UDim2.new(0, 9, 0, 54)
+tabBar.BackgroundColor3 = Colors.card
+tabBar.ZIndex           = 4
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(0, 9)
 
--- Scroll pages  (start at y=90)
-local PY=90
-local PageC=Instance.new("ScrollingFrame",Main)
-PageC.Size=UDim2.new(1,0,1,-PY); PageC.Position=UDim2.new(0,0,0,PY)
-PageC.BackgroundTransparency=1; PageC.ScrollBarThickness=3
-PageC.ScrollBarImageColor3=Color3.fromRGB(58,58,58); PageC.BorderSizePixel=0
-
-local PageH=Instance.new("ScrollingFrame",Main)
-PageH.Size=UDim2.new(1,0,1,-PY); PageH.Position=UDim2.new(0,0,0,PY)
-PageH.BackgroundTransparency=1; PageH.ScrollBarThickness=3
-PageH.ScrollBarImageColor3=Color3.fromRGB(58,58,58)
-PageH.Visible=false; PageH.BorderSizePixel=0
-
--- Changer page layout
-local PAD=10; local cY=9
-
-local function Sep(txt)
-    local L=Instance.new("TextLabel",PageC)
-    L.Size=UDim2.new(1,-PAD*2,0,13); L.Position=UDim2.new(0,PAD,0,cY)
-    L.BackgroundTransparency=1; L.Text=txt; L.TextColor3=C.SUB
-    L.Font=Enum.Font.GothamBold; L.TextSize=9
-    L.TextXAlignment=Enum.TextXAlignment.Left; L.ZIndex=4
-    local d=Instance.new("Frame",PageC)
-    d.Size=UDim2.new(1,-PAD*2,0,1); d.Position=UDim2.new(0,PAD,0,cY+13)
-    d.BackgroundColor3=C.DIV; d.BorderSizePixel=0; d.ZIndex=4
-    cY=cY+19
+local function makeTab(text, xScale, isActive)
+    local btn = Instance.new("TextButton", tabBar)
+    btn.Size             = UDim2.new(0.5, -4, 1, -6)
+    btn.Position         = UDim2.new(xScale, xScale == 0 and 3 or 1, 0, 3)
+    btn.BackgroundColor3 = isActive and Colors.white or Color3.fromRGB(0, 0, 0)
+    btn.BackgroundTransparency = isActive and 0 or 1
+    btn.Text             = text
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 10
+    btn.ZIndex           = 5
+    btn.TextColor3       = isActive and Colors.background or Colors.subtext
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    return btn
 end
 
--- Input box 36px
-local IW=Instance.new("Frame",PageC)
-IW.Size=UDim2.new(1,-PAD*2,0,36); IW.Position=UDim2.new(0,PAD,0,cY)
-IW.BackgroundColor3=C.INPUT; IW.ZIndex=4
-Instance.new("UICorner",IW).CornerRadius=UDim.new(0,10)
-local iSK=Instance.new("UIStroke",IW); iSK.Color=C.STR; iSK.Thickness=1
+local changerTab = makeTab("CHANGER", 0,   true)
+local historyTab = makeTab("HISTORY", 0.5, false)
 
-local iIco=Instance.new("TextLabel",IW)
-iIco.Size=UDim2.new(0,30,1,0); iIco.Text="  "
-iIco.TextColor3=C.SUB; iIco.BackgroundTransparency=1
-iIco.Font=Enum.Font.GothamBold; iIco.TextSize=13; iIco.ZIndex=5
+-- Scroll pages
+local PAGE_Y = 90
 
-local Box=Instance.new("TextBox",IW)
-Box.Size=UDim2.new(1,-32,1,0); Box.Position=UDim2.new(0,28,0,0)
-Box.BackgroundTransparency=1; Box.Text=""
-Box.PlaceholderText="Username / Item ID..."
-Box.PlaceholderColor3=C.SUB; Box.TextColor3=C.TXT
-Box.Font=Enum.Font.Gotham; Box.TextSize=12; Box.ZIndex=5
-Box.ClearTextOnFocus=false
-Box.Focused:Connect(function()  TW(iSK,{Color=C.STRHI,Thickness=1.5},.14) end)
-Box.FocusLost:Connect(function() TW(iSK,{Color=C.STR, Thickness=1},   .14) end)
-cY=cY+44
+local changerPage = Instance.new("ScrollingFrame", mainFrame)
+changerPage.Size                  = UDim2.new(1, 0, 1, -PAGE_Y)
+changerPage.Position              = UDim2.new(0, 0, 0, PAGE_Y)
+changerPage.BackgroundTransparency = 1
+changerPage.ScrollBarThickness    = 3
+changerPage.ScrollBarImageColor3  = Color3.fromRGB(58, 58, 58)
+changerPage.BorderSizePixel       = 0
 
--- Button factory  32px default
-local function MkBtn(txt,bg,fg,bh)
-    bh=bh or 32
-    local card=Instance.new("Frame",PageC)
-    card.Size=UDim2.new(1,-PAD*2,0,bh)
-    card.Position=UDim2.new(0,PAD,0,cY)
-    card.BackgroundColor3=bg; card.ZIndex=4
-    Instance.new("UICorner",card).CornerRadius=UDim.new(0,9)
-    if bg~=C.BPRI then
-        local sk=Instance.new("UIStroke",card); sk.Color=C.DIV; sk.Thickness=1
+local historyPage = Instance.new("ScrollingFrame", mainFrame)
+historyPage.Size                  = UDim2.new(1, 0, 1, -PAGE_Y)
+historyPage.Position              = UDim2.new(0, 0, 0, PAGE_Y)
+historyPage.BackgroundTransparency = 1
+historyPage.ScrollBarThickness    = 3
+historyPage.ScrollBarImageColor3  = Color3.fromRGB(58, 58, 58)
+historyPage.Visible               = false
+historyPage.BorderSizePixel       = 0
+
+-- ── Changer page content ──────────────────────────────────────
+
+local PAD = 10
+local cursorY = 9  -- tracks vertical position inside changerPage
+
+local function addSeparator(text)
+    local label = Instance.new("TextLabel", changerPage)
+    label.Size               = UDim2.new(1, -PAD*2, 0, 13)
+    label.Position           = UDim2.new(0, PAD, 0, cursorY)
+    label.BackgroundTransparency = 1
+    label.Text               = text
+    label.TextColor3         = Colors.subtext
+    label.Font               = Enum.Font.GothamBold
+    label.TextSize           = 9
+    label.TextXAlignment     = Enum.TextXAlignment.Left
+    label.ZIndex             = 4
+
+    local divLine = Instance.new("Frame", changerPage)
+    divLine.Size             = UDim2.new(1, -PAD*2, 0, 1)
+    divLine.Position         = UDim2.new(0, PAD, 0, cursorY + 13)
+    divLine.BackgroundColor3 = Colors.divider
+    divLine.BorderSizePixel  = 0
+    divLine.ZIndex           = 4
+
+    cursorY = cursorY + 19
+end
+
+-- Input box
+local inputWrapper = Instance.new("Frame", changerPage)
+inputWrapper.Size             = UDim2.new(1, -PAD*2, 0, 36)
+inputWrapper.Position         = UDim2.new(0, PAD, 0, cursorY)
+inputWrapper.BackgroundColor3 = Colors.input
+inputWrapper.ZIndex           = 4
+Instance.new("UICorner", inputWrapper).CornerRadius = UDim.new(0, 10)
+local inputStroke = Instance.new("UIStroke", inputWrapper)
+inputStroke.Color     = Colors.stroke
+inputStroke.Thickness = 1
+
+local inputIcon = Instance.new("TextLabel", inputWrapper)
+inputIcon.Size               = UDim2.new(0, 30, 1, 0)
+inputIcon.Text               = "  "
+inputIcon.TextColor3         = Colors.subtext
+inputIcon.BackgroundTransparency = 1
+inputIcon.Font               = Enum.Font.GothamBold
+inputIcon.TextSize           = 13
+inputIcon.ZIndex             = 5
+
+local inputBox = Instance.new("TextBox", inputWrapper)
+inputBox.Size                = UDim2.new(1, -32, 1, 0)
+inputBox.Position            = UDim2.new(0, 28, 0, 0)
+inputBox.BackgroundTransparency = 1
+inputBox.Text                = ""
+inputBox.PlaceholderText     = "Username / Item ID..."
+inputBox.PlaceholderColor3   = Colors.subtext
+inputBox.TextColor3          = Colors.text
+inputBox.Font                = Enum.Font.Gotham
+inputBox.TextSize            = 12
+inputBox.ZIndex              = 5
+inputBox.ClearTextOnFocus    = false
+inputBox.Focused:Connect(function()
+    tween(inputStroke, { Color = Colors.strokeHi, Thickness = 1.5 }, 0.14)
+end)
+inputBox.FocusLost:Connect(function()
+    tween(inputStroke, { Color = Colors.stroke,   Thickness = 1   }, 0.14)
+end)
+cursorY = cursorY + 44
+
+-- Button factory
+local function makeButton(text, bgColor, textColor, height)
+    height = height or 32
+
+    local card = Instance.new("Frame", changerPage)
+    card.Size             = UDim2.new(1, -PAD*2, 0, height)
+    card.Position         = UDim2.new(0, PAD, 0, cursorY)
+    card.BackgroundColor3 = bgColor
+    card.ZIndex           = 4
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 9)
+
+    if bgColor ~= Colors.btnPrimary then
+        local stroke = Instance.new("UIStroke", card)
+        stroke.Color     = Colors.divider
+        stroke.Thickness = 1
     end
-    cY=cY+bh+6
-    local btn=Instance.new("TextButton",card)
-    btn.Size=UDim2.new(1,0,1,0); btn.BackgroundTransparency=1
-    btn.Text=txt; btn.TextColor3=fg or C.TXT
-    btn.Font=Enum.Font.GothamBold; btn.TextSize=11; btn.ZIndex=5
+
+    cursorY = cursorY + height + 6
+
+    local btn = Instance.new("TextButton", card)
+    btn.Size             = UDim2.new(1, 0, 1, 0)
+    btn.BackgroundTransparency = 1
+    btn.Text             = text
+    btn.TextColor3       = textColor or Colors.text
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 11
+    btn.ZIndex           = 5
+
     btn.MouseEnter:Connect(function()
-        TW(card,{BackgroundColor3=Color3.new(
-            math.min(bg.R+.07,1),math.min(bg.G+.07,1),math.min(bg.B+.07,1))},.11)
+        local r = math.min(bgColor.R + 0.07, 1)
+        local g = math.min(bgColor.G + 0.07, 1)
+        local b = math.min(bgColor.B + 0.07, 1)
+        tween(card, { BackgroundColor3 = Color3.new(r, g, b) }, 0.11)
     end)
-    btn.MouseLeave:Connect(function() TW(card,{BackgroundColor3=bg},.11) end)
-    btn.MouseButton1Down:Connect(function() TW(card,{Size=UDim2.new(1,-PAD*2-4,0,bh-3)},.07) end)
-    btn.MouseButton1Up:Connect(function()   TW(card,{Size=UDim2.new(1,-PAD*2,0,bh)},.15)    end)
-    return btn,card
+    btn.MouseLeave:Connect(function()
+        tween(card, { BackgroundColor3 = bgColor }, 0.11)
+    end)
+    btn.MouseButton1Down:Connect(function()
+        tween(card, { Size = UDim2.new(1, -PAD*2 - 4, 0, height - 3) }, 0.07)
+    end)
+    btn.MouseButton1Up:Connect(function()
+        tween(card, { Size = UDim2.new(1, -PAD*2, 0, height) }, 0.15)
+    end)
+
+    return btn, card
 end
 
 -- Toggle factory
-local function MkToggle(txtOff,txtOn,bgOff,bgOn,fgOff,fgOn,onToggle)
-    local btn,card=MkBtn(txtOff,bgOff,fgOff)
-    local state=false
-    local function Sync(v)
-        state=v
-        btn.Text=v and txtOn or txtOff
-        TW(btn,{TextColor3=v and (fgOn or C.TXT) or (fgOff or C.SUB)},.14)
-        TW(card,{BackgroundColor3=v and bgOn or bgOff},.14)
-        local sk=card:FindFirstChildOfClass("UIStroke")
-        if sk then TW(sk,{Color=v and C.STRHI or C.DIV},.14) end
+-- The onToggle callback receives the new boolean value.
+local function makeToggle(textOff, textOn, bgOff, bgOn, colorOff, colorOn, onToggle)
+    local btn, card = makeButton(textOff, bgOff, colorOff)
+    local toggled = false
+
+    local function sync(value)
+        toggled = value
+        btn.Text = value and textOn or textOff
+        tween(btn,  { TextColor3 = value and colorOn or colorOff }, 0.14)
+        tween(card, { BackgroundColor3 = value and bgOn or bgOff }, 0.14)
+        local stroke = card:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            tween(stroke, { Color = value and Colors.strokeHi or Colors.divider }, 0.14)
+        end
     end
+
     btn.MouseButton1Click:Connect(function()
-        Sync(not state)
-        if onToggle then onToggle(state) end
+        sync(not toggled)
+        if onToggle then onToggle(toggled) end
     end)
-    return btn, card, function(v) Sync(v) end
+
+    -- Returns a setter so the reset button can force both to off
+    return btn, card, function(value) sync(value) end
 end
 
--- Build buttons
-Sep("AVATAR")
-local B_CHANGE=MkBtn("  CHANGE AVATAR",           C.BPRI, C.WIN)
-local B_WEAR  =MkBtn("  WEAR ITEM / ID",           C.BSEC, C.TXT)
-local B_INJ   =MkBtn("  INJECT BODY / FACE / HEAD",C.BSEC, C.TXT)
+-- Build all buttons on changer page
+addSeparator("AVATAR")
+local changeAvatarBtn = makeButton("  CHANGE AVATAR",            Colors.btnPrimary,   Colors.background)
+local wearItemBtn     = makeButton("  WEAR ITEM / ID",            Colors.btnSecondary, Colors.text)
+local injectBtn       = makeButton("  INJECT BODY / FACE / HEAD", Colors.btnSecondary, Colors.text)
 
-Sep("TOGGLES")
-local _,_,SetKB=MkToggle(
-    "  KORBLOX: OFF","  KORBLOX: ON",
-    C.BSEC,C.BTOG,C.SUB,C.TXT,
-    function(v) KorbloxOn=v; DoKorblox(v) end
-)
-local _,_,SetHL=MkToggle(
-    "  HEADLESS: OFF","  HEADLESS: ON",
-    C.BSEC,C.BTOG,C.SUB,C.TXT,
-    function(v)
-        HeadlessOn=v
-        local char=X_Player.Character; if not char then return end
-        local head=char:FindFirstChild("Head"); if not head then return end
-        head.Transparency=v and 1 or 0
-        for _,c in pairs(head:GetChildren()) do
-            if c:IsA("Decal") then c.Transparency=v and 1 or 0 end
-        end
+addSeparator("TOGGLES")
+local _, _, setKorblox = makeToggle(
+    "  KORBLOX: OFF", "  KORBLOX: ON",
+    Colors.btnSecondary, Colors.btnToggle,
+    Colors.subtext, Colors.text,
+    function(value)
+        korbloxEnabled = value
+        applyKorblox(value)
+        if value then enforceKorblox(LocalPlayer.Character, true) end
     end
 )
 
-Sep("MANAGE")
-local B_FAV  =MkBtn("  ADD TO FAVORITES",   C.BFAV,Color3.fromRGB(208,165,55))
-local B_SAVO =MkBtn("  SAVE CURRENT OUTFIT", C.BSAV,Color3.fromRGB(75,196,95))
-local B_RESET=MkBtn("  RESET AVATAR",        C.BDNG,Color3.fromRGB(218,85,85))
-
-PageC.CanvasSize=UDim2.new(0,0,0,cY+8)
-
--- Button actions
-B_CHANGE.MouseButton1Click:Connect(function() ChangeAvatar(Box.Text) end)
-
-B_WEAR.MouseButton1Click:Connect(function()
-    local cid=Box.Text:match("%d+")
-    if not cid then Notify("No ID found",C.NERR); return end
-    if WearSingleItem(cid) then
-        for i,e in ipairs(ItemHistory) do
-            if (type(e)=="table" and e.id==cid) or e==cid then table.remove(ItemHistory,i); break end
+local _, _, setHeadless = makeToggle(
+    "  HEADLESS: OFF", "  HEADLESS: ON",
+    Colors.btnSecondary, Colors.btnToggle,
+    Colors.subtext, Colors.text,
+    function(value)
+        headlessEnabled = value
+        local char = LocalPlayer.Character
+        local head = char and char:FindFirstChild("Head")
+        if head then
+            head.Transparency = value and 1 or 0
+            for _, v in pairs(head:GetChildren()) do
+                if v:IsA("Decal") then v.Transparency = value and 1 or 0 end
+            end
         end
-        table.insert(ItemHistory,1,{id=cid,time=os.time()})
-        if #ItemHistory>30 then table.remove(ItemHistory) end
-        SaveData()
-    else Notify("Item not found",C.NERR) end
+        if value then enforceHeadless(char, true) end
+    end
+)
+
+addSeparator("MANAGE")
+local addFavBtn    = makeButton("  ADD TO FAVORITES",    Colors.btnFav,    Color3.fromRGB(208, 165, 55))
+local saveOutfitBtn = makeButton("  SAVE CURRENT OUTFIT", Colors.btnSave,   Color3.fromRGB(75,  196, 95))
+local resetBtn     = makeButton("  RESET AVATAR",         Colors.btnDanger, Color3.fromRGB(218, 85,  85))
+
+changerPage.CanvasSize = UDim2.new(0, 0, 0, cursorY + 8)
+
+-- Button click handlers
+changeAvatarBtn.MouseButton1Click:Connect(function()
+    changeAvatar(inputBox.Text)
 end)
 
-B_INJ.MouseButton1Click:Connect(function()
-    local cid=Box.Text:match("%d+")
-    if not cid then Notify("No ID found",C.NERR); return end
-    InjectPart(cid)
+wearItemBtn.MouseButton1Click:Connect(function()
+    local id = inputBox.Text:match("%d+")
+    if not id then notify("No ID found", Colors.notifyErr); return end
+
+    if wearItem(id) then
+        -- Push to item history
+        for i, entry in ipairs(itemHistory) do
+            local storedId = type(entry) == "table" and entry.id or tostring(entry)
+            if storedId == id then table.remove(itemHistory, i); break end
+        end
+        table.insert(itemHistory, 1, { id = id, time = os.time() })
+        if #itemHistory > 30 then table.remove(itemHistory) end
+        saveData()
+    else
+        notify("Item not found", Colors.notifyErr)
+    end
 end)
 
-B_FAV.MouseButton1Click:Connect(function()
-    local txt=Box.Text:match("^%s*(.-)%s*$")
-    if txt=="" then Notify("Enter something first",C.NERR); return end
-    if table.find(Favorites,txt) then Notify("Already in Favorites",C.NERR); return end
-    table.insert(Favorites,txt); SaveData(); Notify("Added to Favorites",C.NFAV)
+injectBtn.MouseButton1Click:Connect(function()
+    local id = inputBox.Text:match("%d+")
+    if not id then notify("No ID found", Colors.notifyErr); return end
+    injectPart(id)
 end)
 
-B_SAVO.MouseButton1Click:Connect(function()
-    if not CurHDesc and #CurItems==0 then Notify("No outfit applied yet",C.NERR); return end
-    local name=Box.Text:match("^%s*(.-)%s*$")
-    name=(name~="") and name or ("Outfit "..os.date("%H:%M"))
-    SavedOutfits[name]={hDesc=CurHDesc, items=CurItems}
-    Notify("Saved: "..name, C.NSAV)
+addFavBtn.MouseButton1Click:Connect(function()
+    local text = inputBox.Text:match("^%s*(.-)%s*$")
+    if text == "" then notify("Enter something first", Colors.notifyErr); return end
+    if table.find(favorites, text) then notify("Already in Favorites", Colors.notifyErr); return end
+    table.insert(favorites, text)
+    saveData()
+    notify("Added to Favorites", Colors.notifyFav)
 end)
 
-B_RESET.MouseButton1Click:Connect(function()
-    KorbloxOn=false; HeadlessOn=false; SetKB(false); SetHL(false)
-    ApplyAvatar(OrigHDesc, OrigItems, true)
+saveOutfitBtn.MouseButton1Click:Connect(function()
+    if not currentHDesc and #currentItems == 0 then
+        notify("No outfit applied yet", Colors.notifyErr)
+        return
+    end
+    local name = inputBox.Text:match("^%s*(.-)%s*$")
+    name = (name ~= "") and name or ("Outfit " .. os.date("%H:%M"))
+    savedOutfits[name] = { hDesc = currentHDesc, items = currentItems }
+    notify("Saved: " .. name, Colors.notifySave)
 end)
 
--- History page
-local function FmtTime(t)
-    if not t then return nil end
-    local d=os.time()-t
-    if d<60 then return d.."s ago"
-    elseif d<3600 then return math.floor(d/60).."m ago"
-    else return math.floor(d/3600).."h ago" end
+resetBtn.MouseButton1Click:Connect(function()
+    korbloxEnabled  = false
+    headlessEnabled = false
+    setKorblox(false)
+    setHeadless(false)
+    applyAvatar(originalHDesc, originalItems, true)
+end)
+
+-- ── History page ──────────────────────────────────────────────
+
+local function formatRelativeTime(timestamp)
+    if not timestamp then return nil end
+    local delta = os.time() - timestamp
+    if delta < 60 then
+        return delta .. "s ago"
+    elseif delta < 3600 then
+        return math.floor(delta / 60) .. "m ago"
+    else
+        return math.floor(delta / 3600) .. "h ago"
+    end
 end
 
-local function MkHCard(par,mainTxt,subTxt,bg,onClick)
-    local h=subTxt and 40 or 34
-    local card=Instance.new("Frame",par)
-    card.Size=UDim2.new(1,-18,0,h)
-    card.BackgroundColor3=bg or C.CARD; card.ZIndex=4
-    Instance.new("UICorner",card).CornerRadius=UDim.new(0,8)
-    local sk=Instance.new("UIStroke",card); sk.Color=C.DIV; sk.Thickness=1
-    local lbl=Instance.new("TextButton",card)
-    lbl.Size=UDim2.new(1,-38,subTxt and 0 or 1,subTxt and 19 or 0)
-    lbl.Position=UDim2.new(0,9,0,subTxt and 4 or 0)
-    lbl.BackgroundTransparency=1; lbl.Text=mainTxt; lbl.TextColor3=C.TXT
-    lbl.Font=Enum.Font.GothamBold; lbl.TextSize=10
-    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=5
-    lbl.TextTruncate=Enum.TextTruncate.AtEnd
-    if subTxt then
-        local s=Instance.new("TextLabel",card)
-        s.Size=UDim2.new(1,-38,0,12); s.Position=UDim2.new(0,9,0,22)
-        s.BackgroundTransparency=1; s.Text=subTxt; s.TextColor3=C.SUB
-        s.Font=Enum.Font.Gotham; s.TextSize=9
-        s.TextXAlignment=Enum.TextXAlignment.Left; s.ZIndex=5
+local function makeHistoryCard(parent, mainText, subText, bgColor, onClick)
+    local height = subText and 40 or 34
+
+    local card = Instance.new("Frame", parent)
+    card.Size             = UDim2.new(1, -18, 0, height)
+    card.BackgroundColor3 = bgColor or Colors.card
+    card.ZIndex           = 4
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
+    local cardStroke = Instance.new("UIStroke", card)
+    cardStroke.Color     = Colors.divider
+    cardStroke.Thickness = 1
+
+    local label = Instance.new("TextButton", card)
+    label.Size             = UDim2.new(1, -38, subText and 0 or 1, subText and 19 or 0)
+    label.Position         = UDim2.new(0, 9, 0, subText and 4 or 0)
+    label.BackgroundTransparency = 1
+    label.Text             = mainText
+    label.TextColor3       = Colors.text
+    label.Font             = Enum.Font.GothamBold
+    label.TextSize         = 10
+    label.TextXAlignment   = Enum.TextXAlignment.Left
+    label.ZIndex           = 5
+    label.TextTruncate     = Enum.TextTruncate.AtEnd
+
+    if subText then
+        local sub = Instance.new("TextLabel", card)
+        sub.Size             = UDim2.new(1, -38, 0, 12)
+        sub.Position         = UDim2.new(0, 9, 0, 22)
+        sub.BackgroundTransparency = 1
+        sub.Text             = subText
+        sub.TextColor3       = Colors.subtext
+        sub.Font             = Enum.Font.Gotham
+        sub.TextSize         = 9
+        sub.TextXAlignment   = Enum.TextXAlignment.Left
+        sub.ZIndex           = 5
     end
+
     if onClick then
-        lbl.MouseButton1Click:Connect(onClick)
-        lbl.MouseEnter:Connect(function()  TW(card,{BackgroundColor3=C.CHOV},.09) end)
-        lbl.MouseLeave:Connect(function()  TW(card,{BackgroundColor3=bg or C.CARD},.09) end)
+        label.MouseButton1Click:Connect(onClick)
+        label.MouseEnter:Connect(function()
+            tween(card, { BackgroundColor3 = Colors.cardHover }, 0.09)
+        end)
+        label.MouseLeave:Connect(function()
+            tween(card, { BackgroundColor3 = bgColor or Colors.card }, 0.09)
+        end)
     end
+
     return card
 end
 
-local function MkSecLbl(par,txt,lo)
-    local l=Instance.new("TextLabel",par)
-    l.Size=UDim2.new(1,-18,0,17); l.BackgroundTransparency=1
-    l.Text=txt; l.TextColor3=C.STRHI; l.Font=Enum.Font.GothamBold; l.TextSize=9
-    l.TextXAlignment=Enum.TextXAlignment.Left; l.ZIndex=4; l.LayoutOrder=lo
-    return l
+local function makeDeleteButton(parent, onDelete)
+    local btn = Instance.new("TextButton", parent)
+    btn.Size             = UDim2.new(0, 22, 0, 22)
+    btn.Position         = UDim2.new(1, -28, 0.5, -11)
+    btn.BackgroundColor3 = Color3.fromRGB(40, 14, 14)
+    btn.Text             = "✕"
+    btn.TextColor3       = Color3.fromRGB(185, 60, 60)
+    btn.Font             = Enum.Font.GothamBold
+    btn.TextSize         = 10
+    btn.ZIndex           = 6
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(onDelete)
 end
 
-local function MkDelBtn(par,cb)
-    local d=Instance.new("TextButton",par)
-    d.Size=UDim2.new(0,22,0,22); d.Position=UDim2.new(1,-28,.5,-11)
-    d.BackgroundColor3=Color3.fromRGB(40,14,14); d.Text="✕"
-    d.TextColor3=Color3.fromRGB(185,60,60)
-    d.Font=Enum.Font.GothamBold; d.TextSize=10; d.ZIndex=6
-    Instance.new("UICorner",d).CornerRadius=UDim.new(0,6)
-    d.MouseButton1Click:Connect(cb)
+local function makeSectionLabel(parent, text, layoutOrder)
+    local label = Instance.new("TextLabel", parent)
+    label.Size               = UDim2.new(1, -18, 0, 17)
+    label.BackgroundTransparency = 1
+    label.Text               = text
+    label.TextColor3         = Colors.strokeHi
+    label.Font               = Enum.Font.GothamBold
+    label.TextSize           = 9
+    label.TextXAlignment     = Enum.TextXAlignment.Left
+    label.ZIndex             = 4
+    label.LayoutOrder        = layoutOrder
+    return label
 end
 
-local function GoChanger(txt)
-    if txt then Box.Text=txt end
-    PageH.Visible=false; PageC.Visible=true
-    TW(TAB_C,{BackgroundColor3=C.WHITE,BackgroundTransparency=0,TextColor3=C.WIN},.14)
-    TW(TAB_H,{BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,TextColor3=C.SUB},.14)
+local function switchToChanger(text)
+    if text then inputBox.Text = text end
+    historyPage.Visible = false
+    changerPage.Visible = true
+    tween(changerTab, { BackgroundColor3 = Colors.white, BackgroundTransparency = 0, TextColor3 = Colors.background }, 0.14)
+    tween(historyTab, { BackgroundColor3 = Color3.fromRGB(0,0,0), BackgroundTransparency = 1, TextColor3 = Colors.subtext }, 0.14)
 end
 
-local function BuildHistory()
-    for _,v in pairs(PageH:GetChildren()) do
-        if not v:IsA("UIListLayout") and not v:IsA("UIPadding") then v:Destroy() end
+local function rebuildHistory()
+    -- Clear old children
+    for _, v in pairs(historyPage:GetChildren()) do
+        if not v:IsA("UIListLayout") and not v:IsA("UIPadding") then
+            v:Destroy()
+        end
     end
-    local lay=Instance.new("UIListLayout",PageH)
-    lay.Padding=UDim.new(0,5); lay.HorizontalAlignment=Enum.HorizontalAlignment.Center
-    lay.SortOrder=Enum.SortOrder.LayoutOrder
-    Instance.new("UIPadding",PageH).PaddingTop=UDim.new(0,7)
-    local lo=1; local hasAny=false
 
-    if next(SavedOutfits) then
-        hasAny=true
-        MkSecLbl(PageH,"  SAVED OUTFITS",lo); lo=lo+1
-        for name,data in pairs(SavedOutfits) do
-            local c=MkHCard(PageH,name,nil,Color3.fromRGB(16,30,18),function()
-                ApplyAvatar(data.hDesc, data.items, false)
-                Notify("Loaded: "..name, C.NSAV)
+    local layout = Instance.new("UIListLayout", historyPage)
+    layout.Padding             = UDim.new(0, 5)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.SortOrder           = Enum.SortOrder.LayoutOrder
+
+    local padding = Instance.new("UIPadding", historyPage)
+    padding.PaddingTop = UDim.new(0, 7)
+
+    local order = 1
+    local hasContent = false
+
+    -- Saved outfits
+    if next(savedOutfits) then
+        hasContent = true
+        makeSectionLabel(historyPage, "  SAVED OUTFITS", order); order = order + 1
+        for name, data in pairs(savedOutfits) do
+            local card = makeHistoryCard(
+                historyPage, name, nil,
+                Color3.fromRGB(16, 30, 18),
+                function()
+                    applyAvatar(data.hDesc, data.items, false)
+                    notify("Loaded: " .. name, Colors.notifySave)
+                end
+            )
+            card.LayoutOrder = order; order = order + 1
+            makeDeleteButton(card, function()
+                savedOutfits[name] = nil
+                rebuildHistory()
             end)
-            c.LayoutOrder=lo; lo=lo+1
-            MkDelBtn(c,function() SavedOutfits[name]=nil; BuildHistory() end)
         end
     end
 
-    if #Favorites>0 then
-        hasAny=true
-        MkSecLbl(PageH,"  FAVORITES",lo); lo=lo+1
-        for idx,fav in ipairs(Favorites) do
-            local c=MkHCard(PageH,fav,nil,Color3.fromRGB(34,24,8),function() GoChanger(fav) end)
-            c.LayoutOrder=lo; lo=lo+1
-            local di=idx
-            MkDelBtn(c,function() table.remove(Favorites,di); SaveData(); BuildHistory() end)
+    -- Favorites
+    if #favorites > 0 then
+        hasContent = true
+        makeSectionLabel(historyPage, "  FAVORITES", order); order = order + 1
+        for idx, fav in ipairs(favorites) do
+            local card = makeHistoryCard(
+                historyPage, fav, nil,
+                Color3.fromRGB(34, 24, 8),
+                function() switchToChanger(fav) end
+            )
+            card.LayoutOrder = order; order = order + 1
+            local capturedIdx = idx
+            makeDeleteButton(card, function()
+                table.remove(favorites, capturedIdx)
+                saveData()
+                rebuildHistory()
+            end)
         end
     end
 
-    if #History>0 then
-        hasAny=true
-        MkSecLbl(PageH,"  AVATAR HISTORY",lo); lo=lo+1
-        for _,e in ipairs(History) do
-            local name=type(e)=="table" and e.name or tostring(e)
-            local ts=type(e)=="table" and FmtTime(e.time) or nil
-            local c=MkHCard(PageH,name,ts,C.CARD,function() GoChanger(name) end)
-            c.LayoutOrder=lo; lo=lo+1
+    -- Avatar history
+    if #avatarHistory > 0 then
+        hasContent = true
+        makeSectionLabel(historyPage, "  AVATAR HISTORY", order); order = order + 1
+        for _, entry in ipairs(avatarHistory) do
+            local name = type(entry) == "table" and entry.name or tostring(entry)
+            local time = type(entry) == "table" and formatRelativeTime(entry.time) or nil
+            local card = makeHistoryCard(
+                historyPage, name, time,
+                Colors.card,
+                function() switchToChanger(name) end
+            )
+            card.LayoutOrder = order; order = order + 1
         end
     end
 
-    if #ItemHistory>0 then
-        hasAny=true
-        MkSecLbl(PageH,"  ITEM HISTORY",lo); lo=lo+1
-        for _,e in ipairs(ItemHistory) do
-            local id=type(e)=="table" and e.id or tostring(e)
-            local ts=type(e)=="table" and FmtTime(e.time) or nil
-            local c=MkHCard(PageH,"ID: "..id,ts,C.CARD,function() GoChanger(id) end)
-            c.LayoutOrder=lo; lo=lo+1
+    -- Item history
+    if #itemHistory > 0 then
+        hasContent = true
+        makeSectionLabel(historyPage, "  ITEM HISTORY", order); order = order + 1
+        for _, entry in ipairs(itemHistory) do
+            local id   = type(entry) == "table" and entry.id or tostring(entry)
+            local time = type(entry) == "table" and formatRelativeTime(entry.time) or nil
+            local card = makeHistoryCard(
+                historyPage, "ID: " .. id, time,
+                Colors.card,
+                function() switchToChanger(id) end
+            )
+            card.LayoutOrder = order; order = order + 1
         end
     end
 
-    if not hasAny then
-        local e=Instance.new("TextLabel",PageH)
-        e.Size=UDim2.new(1,0,0,50); e.BackgroundTransparency=1
-        e.Text="Nothing saved yet"; e.TextColor3=C.SUB
-        e.Font=Enum.Font.Gotham; e.TextSize=11; e.ZIndex=4; e.LayoutOrder=1
+    -- Empty state
+    if not hasContent then
+        local empty = Instance.new("TextLabel", historyPage)
+        empty.Size               = UDim2.new(1, 0, 0, 50)
+        empty.BackgroundTransparency = 1
+        empty.Text               = "Nothing saved yet"
+        empty.TextColor3         = Colors.subtext
+        empty.Font               = Enum.Font.Gotham
+        empty.TextSize           = 11
+        empty.ZIndex             = 4
+        empty.LayoutOrder        = 1
     end
 
-    if #History>0 or #ItemHistory>0 then
-        local clr=Instance.new("TextButton",PageH)
-        clr.Size=UDim2.new(1,-18,0,28); clr.BackgroundColor3=Color3.fromRGB(36,12,12)
-        clr.Text="  CLEAR HISTORY"; clr.TextColor3=Color3.fromRGB(185,60,60)
-        clr.Font=Enum.Font.GothamBold; clr.TextSize=10; clr.ZIndex=4; clr.LayoutOrder=lo+999
-        Instance.new("UICorner",clr).CornerRadius=UDim.new(0,8)
-        clr.MouseButton1Click:Connect(function()
-            History={}; ItemHistory={}; SaveData(); BuildHistory()
-            Notify("History Cleared",C.NERR)
+    -- Clear history button
+    if #avatarHistory > 0 or #itemHistory > 0 then
+        local clearBtn = Instance.new("TextButton", historyPage)
+        clearBtn.Size             = UDim2.new(1, -18, 0, 28)
+        clearBtn.BackgroundColor3 = Color3.fromRGB(36, 12, 12)
+        clearBtn.Text             = "  CLEAR HISTORY"
+        clearBtn.TextColor3       = Color3.fromRGB(185, 60, 60)
+        clearBtn.Font             = Enum.Font.GothamBold
+        clearBtn.TextSize         = 10
+        clearBtn.ZIndex           = 4
+        clearBtn.LayoutOrder      = order + 999
+        Instance.new("UICorner", clearBtn).CornerRadius = UDim.new(0, 8)
+        clearBtn.MouseButton1Click:Connect(function()
+            avatarHistory = {}
+            itemHistory   = {}
+            saveData()
+            rebuildHistory()
+            notify("History Cleared", Colors.notifyErr)
         end)
     end
 
     task.wait()
-    PageH.CanvasSize=UDim2.new(0,0,0,lay.AbsoluteContentSize.Y+20)
+    historyPage.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 20)
 end
 
-TAB_H.MouseButton1Click:Connect(function()
-    PageC.Visible=false; PageH.Visible=true; BuildHistory()
-    TW(TAB_H,{BackgroundColor3=C.WHITE,BackgroundTransparency=0,TextColor3=C.WIN},.14)
-    TW(TAB_C,{BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,TextColor3=C.SUB},.14)
-end)
-TAB_C.MouseButton1Click:Connect(function()
-    PageH.Visible=false; PageC.Visible=true
-    TW(TAB_C,{BackgroundColor3=C.WHITE,BackgroundTransparency=0,TextColor3=C.WIN},.14)
-    TW(TAB_H,{BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,TextColor3=C.SUB},.14)
+-- Tab switching
+historyTab.MouseButton1Click:Connect(function()
+    changerPage.Visible = false
+    historyPage.Visible = true
+    rebuildHistory()
+    tween(historyTab, { BackgroundColor3 = Colors.white, BackgroundTransparency = 0, TextColor3 = Colors.background }, 0.14)
+    tween(changerTab, { BackgroundColor3 = Color3.fromRGB(0,0,0), BackgroundTransparency = 1, TextColor3 = Colors.subtext }, 0.14)
 end)
 
--- Floating icon
-local Ico=Instance.new("TextButton",Gui)
-Ico.Size=UDim2.new(0,44,0,44); Ico.Position=UDim2.new(0,12,0,12)
-Ico.BackgroundColor3=Color3.fromRGB(14,14,14); Ico.Text=""; Ico.ZIndex=5
-Instance.new("UICorner",Ico).CornerRadius=UDim.new(0,12)
-local icoSK=Instance.new("UIStroke",Ico); icoSK.Color=C.STR; icoSK.Thickness=1.2
+changerTab.MouseButton1Click:Connect(function()
+    historyPage.Visible = false
+    changerPage.Visible = true
+    tween(changerTab, { BackgroundColor3 = Colors.white, BackgroundTransparency = 0, TextColor3 = Colors.background }, 0.14)
+    tween(historyTab, { BackgroundColor3 = Color3.fromRGB(0,0,0), BackgroundTransparency = 1, TextColor3 = Colors.subtext }, 0.14)
+end)
 
-local icoL=Instance.new("TextLabel",Ico)
-icoL.Size=UDim2.new(1,0,.65,0); icoL.Position=UDim2.new(0,0,.1,0)
-icoL.Text=""; icoL.TextSize=19; icoL.BackgroundTransparency=1
-icoL.ZIndex=6; icoL.Font=Enum.Font.Gotham
+-- ── Floating toggle button ────────────────────────────────────
 
-local Dot=Instance.new("Frame",Ico)
-Dot.Size=UDim2.new(0,8,0,8); Dot.Position=UDim2.new(1,-10,0,2)
-Dot.BackgroundColor3=Color3.fromRGB(215,48,48); Dot.ZIndex=7
-Instance.new("UICorner",Dot).CornerRadius=UDim.new(1,0)
+local iconButton = Instance.new("TextButton", screenGui)
+iconButton.Size             = UDim2.new(0, 44, 0, 44)
+iconButton.Position         = UDim2.new(0, 12, 0, 12)
+iconButton.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+iconButton.Text             = ""
+iconButton.ZIndex           = 5
+Instance.new("UICorner", iconButton).CornerRadius = UDim.new(0, 12)
+local iconStroke = Instance.new("UIStroke", iconButton)
+iconStroke.Color     = Colors.stroke
+iconStroke.Thickness = 1.2
 
-local function SetDot(open)
-    TW(Dot,{BackgroundColor3=open and Color3.fromRGB(80,210,100)
-                               or Color3.fromRGB(215,48,48)},.2)
+local iconLabel = Instance.new("TextLabel", iconButton)
+iconLabel.Size               = UDim2.new(1, 0, 0.65, 0)
+iconLabel.Position           = UDim2.new(0, 0, 0.1, 0)
+iconLabel.Text               = ""
+iconLabel.TextSize           = 19
+iconLabel.BackgroundTransparency = 1
+iconLabel.ZIndex             = 6
+iconLabel.Font               = Enum.Font.Gotham
+
+local statusDot = Instance.new("Frame", iconButton)
+statusDot.Size             = UDim2.new(0, 8, 0, 8)
+statusDot.Position         = UDim2.new(1, -10, 0, 2)
+statusDot.BackgroundColor3 = Color3.fromRGB(215, 48, 48)
+statusDot.ZIndex           = 7
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+
+local function setStatusDot(open)
+    tween(statusDot, {
+        BackgroundColor3 = open
+            and Color3.fromRGB(80, 210, 100)
+            or  Color3.fromRGB(215, 48, 48)
+    }, 0.2)
 end
-Ico.MouseEnter:Connect(function()
-    TWBack(Ico,{Size=UDim2.new(0,48,0,48),Position=UDim2.new(0,10,0,10)},.2)
-    TW(icoSK,{Color=C.STRHI},.12)
+
+iconButton.MouseEnter:Connect(function()
+    tweenBack(iconButton, { Size = UDim2.new(0, 48, 0, 48), Position = UDim2.new(0, 10, 0, 10) }, 0.2)
+    tween(iconStroke, { Color = Colors.strokeHi }, 0.12)
 end)
-Ico.MouseLeave:Connect(function()
-    TWBack(Ico,{Size=UDim2.new(0,44,0,44),Position=UDim2.new(0,12,0,12)},.2)
-    TW(icoSK,{Color=C.STR},.12)
+iconButton.MouseLeave:Connect(function()
+    tweenBack(iconButton, { Size = UDim2.new(0, 44, 0, 44), Position = UDim2.new(0, 12, 0, 12) }, 0.2)
+    tween(iconStroke, { Color = Colors.stroke }, 0.12)
 end)
 
-local function OpenWin()
-    Main.Size=UDim2.new(0,0,0,0); Main.Position=UDim2.new(.5,0,.5,0); Main.Visible=true
-    TWBack(Main,{Size=UDim2.new(0,WIN_W,0,WIN_H),Position=UDim2.new(.5,-WIN_W/2,.5,-WIN_H/2)},.36)
-    SetDot(true)
+local function openWindow()
+    mainFrame.Size     = UDim2.new(0, 0, 0, 0)
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    mainFrame.Visible  = true
+    tweenBack(mainFrame, {
+        Size     = UDim2.new(0, WIN_W, 0, WIN_H),
+        Position = UDim2.new(0.5, -WIN_W/2, 0.5, -WIN_H/2)
+    }, 0.36)
+    setStatusDot(true)
 end
-local function CloseWin()
-    TW(Main,{Size=UDim2.new(0,0,0,0),Position=UDim2.new(.5,0,.5,0)},.17)
-    task.delay(.19,function() Main.Visible=false end); SetDot(false)
-end
-Ico.MouseButton1Click:Connect(function()
-    if not Main.Visible then OpenWin() else CloseWin() end
-end)
-CloseBtn.MouseButton1Click:Connect(CloseWin)
 
--- Drag
-local function Drag(obj,handle)
-    local drag,inp,sp,sop
-    handle.InputBegan:Connect(function(x)
-        if x.UserInputType==Enum.UserInputType.MouseButton1
-        or x.UserInputType==Enum.UserInputType.Touch then
-            drag=true; sp=x.Position; sop=obj.Position
-            x.Changed:Connect(function()
-                if x.UserInputState==Enum.UserInputState.End then drag=false end
+local function closeWindow()
+    tween(mainFrame, {
+        Size     = UDim2.new(0, 0, 0, 0),
+        Position = UDim2.new(0.5, 0, 0.5, 0)
+    }, 0.17)
+    task.delay(0.19, function() mainFrame.Visible = false end)
+    setStatusDot(false)
+end
+
+iconButton.MouseButton1Click:Connect(function()
+    if not mainFrame.Visible then openWindow() else closeWindow() end
+end)
+closeButton.MouseButton1Click:Connect(closeWindow)
+
+-- ── Drag ──────────────────────────────────────────────────────
+
+local function makeDraggable(frame, handle)
+    local isDragging = false
+    local dragInput   = nil
+    local startMouse  = nil
+    local startPos    = nil
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = true
+            startMouse = input.Position
+            startPos   = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    isDragging = false
+                end
             end)
         end
     end)
-    handle.InputChanged:Connect(function(x)
-        if x.UserInputType==Enum.UserInputType.MouseMovement
-        or x.UserInputType==Enum.UserInputType.Touch then inp=x end
+
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
     end)
-    X_UIS.InputChanged:Connect(function(x)
-        if x==inp and drag then
-            local d=x.Position-sp
-            obj.Position=UDim2.new(sop.X.Scale,sop.X.Offset+d.X,sop.Y.Scale,sop.Y.Offset+d.Y)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and isDragging then
+            local delta = input.Position - startMouse
+            frame.Position = UDim2.new(
+                startPos.X.Scale,  startPos.X.Offset  + delta.X,
+                startPos.Y.Scale,  startPos.Y.Offset  + delta.Y
+            )
         end
     end)
 end
-Drag(Main,HDR); Drag(Ico,Ico)
 
--- Respawn
-X_Player.CharacterAdded:Connect(function()
+makeDraggable(mainFrame, header)
+makeDraggable(iconButton, iconButton)
+
+-- ============================================================
+-- Respawn handler
+-- ============================================================
+
+LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.8)
-    local hasOutfit=(CurHDesc~=nil) or (#CurItems>0)
+    local hasOutfit = (currentHDesc ~= nil) or (#currentItems > 0)
     if hasOutfit then
-        ApplyAvatar(CurHDesc, CurItems, false)
+        applyAvatar(currentHDesc, currentItems, false)
     end
-    task.spawn(StartFOV)
+    task.spawn(startFOVFix)
 end)
 
--- Init — capture original state
-local initChar=X_Player.Character or X_Player.CharacterAdded:Wait()
+-- ============================================================
+-- Initialise — capture original avatar state
+-- ============================================================
 
+local initialChar = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+
+-- Try getting the HumanoidDescription from the humanoid first (most accurate)
 pcall(function()
-    local hum=initChar:FindFirstChildOfClass("Humanoid")
-    if hum then OrigHDesc=hum:GetAppliedDescription() end
+    local hum = initialChar:FindFirstChildOfClass("Humanoid")
+    if hum then
+        originalHDesc = hum:GetAppliedDescription()
+    end
 end)
-if not OrigHDesc then
+
+-- Fall back to the API if that didn't work
+if not originalHDesc then
     pcall(function()
-        OrigHDesc=X_Players:GetHumanoidDescriptionFromUserId(X_Player.UserId)
+        originalHDesc = Players:GetHumanoidDescriptionFromUserId(LocalPlayer.UserId)
     end)
 end
 
--- Capture original items for manual-mode reset
-for _,v in pairs(initChar:GetDescendants()) do
-    local cls=v.ClassName
-    if cls=="Accessory" or cls=="Shirt" or cls=="Pants" or cls=="ShirtGraphic"
-    or cls=="BodyColors" or cls=="CharacterMesh" then
-        table.insert(OrigItems, v:Clone())
-    elseif cls=="Decal" and v.Name=="face" and v.Parent and v.Parent.Name=="Head" then
-        table.insert(OrigItems, v:Clone())
-    elseif cls=="SpecialMesh" and v.Parent and v.Parent.Name=="Head" then
-        table.insert(OrigItems, v:Clone())
+-- Capture the original cosmetics for manual-mode reset
+for _, v in pairs(initialChar:GetDescendants()) do
+    local cls = v.ClassName
+    if cls == "Accessory"
+    or cls == "Shirt" or cls == "Pants" or cls == "ShirtGraphic"
+    or cls == "BodyColors" or cls == "CharacterMesh" then
+        table.insert(originalItems, v:Clone())
+    elseif cls == "Decal" and v.Name == "face" and v.Parent and v.Parent.Name == "Head" then
+        table.insert(originalItems, v:Clone())
+    elseif cls == "SpecialMesh" and v.Parent and v.Parent.Name == "Head" then
+        table.insert(originalItems, v:Clone())
     end
 end
 
-task.spawn(StartFOV)
-Notify("Avatar Changer V97  Ready", C.NOK)
+task.spawn(startFOVFix)
+notify("Avatar Changer V98  Ready", Colors.notifyOk)
