@@ -1,5 +1,5 @@
 --[[
-    Avatar Changer V98
+    Avatar Changer V99
     by XYTHC
 
     Changes:
@@ -387,6 +387,16 @@ local function applyItemsToChar(items, char, isReset)
     local rig  = getRig(char)
     local head = char:FindFirstChild("Head")
 
+    -- Reset all body part visibility FIRST (before applying items)
+    -- so korblox/headless set at the end of applyAvatar won't get stomped
+    for _, v in pairs(char:GetDescendants()) do
+        if v:IsA("BasePart")
+        and v.Name ~= "HumanoidRootPart"
+        and v.Name ~= "Head" then
+            v.Transparency = 0
+        end
+    end
+
     -- Strip existing cosmetics
     for _, v in pairs(char:GetChildren()) do
         if v:IsA("Accessory")
@@ -470,14 +480,6 @@ local function applyItemsToChar(items, char, isReset)
         end
     end
 
-    -- Make sure body parts are all visible
-    for _, v in pairs(char:GetDescendants()) do
-        if v:IsA("BasePart")
-        and v.Name ~= "HumanoidRootPart"
-        and v.Name ~= "Head" then
-            v.Transparency = 0
-        end
-    end
 end
 
 -- ============================================================
@@ -542,15 +544,21 @@ local function applyAvatar(hDesc, items, isReset)
         currentItems = items
     end
 
-    -- Enforce headless and korblox in a loop so ApplyDescription
-    -- can't overwrite the transparency changes after we set them
-    if headlessEnabled then
-        enforceHeadless(char, true)
+    -- Apply headless and korblox synchronously RIGHT HERE, last thing before notify.
+    -- V90 worked because it did this directly inside FinalApply with no async.
+    -- The body-reset in applyItemsToChar now runs at the top of that function,
+    -- so there is nothing left to stomp on these after we set them.
+    local head = char:FindFirstChild("Head")
+    if head then
+        head.Transparency = headlessEnabled and 1 or 0
+        for _, v in pairs(head:GetChildren()) do
+            if v:IsA("Decal") then
+                v.Transparency = headlessEnabled and 1 or 0
+            end
+        end
     end
-    if korbloxEnabled then
-        applyKorblox(true)
-        enforceKorblox(char, true)
-    end
+
+    applyKorblox(korbloxEnabled)
 
     task.spawn(startFOVFix)
     notify(isReset and "Avatar Reset" or "Avatar Applied",
@@ -799,7 +807,7 @@ titleLabel.ZIndex             = 5
 local versionLabel = Instance.new("TextLabel", header)
 versionLabel.Size               = UDim2.new(0, 180, 0, 12)
 versionLabel.Position           = UDim2.new(0, 13, 0, 28)
-versionLabel.Text               = "V98  ·  by XYTHC"
+versionLabel.Text               = "V99  ·  by XYTHC"
 versionLabel.TextColor3         = Colors.subtext
 versionLabel.Font               = Enum.Font.Gotham
 versionLabel.TextSize           = 9
@@ -1024,7 +1032,6 @@ local _, _, setKorblox = makeToggle(
     function(value)
         korbloxEnabled = value
         applyKorblox(value)
-        if value then enforceKorblox(LocalPlayer.Character, true) end
     end
 )
 
@@ -1042,7 +1049,6 @@ local _, _, setHeadless = makeToggle(
                 if v:IsA("Decal") then v.Transparency = value and 1 or 0 end
             end
         end
-        if value then enforceHeadless(char, true) end
     end
 )
 
