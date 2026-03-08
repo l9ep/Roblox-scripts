@@ -519,19 +519,35 @@ local function autoCanvas(sf)
     end
 end
 local function drag(handle, target)
-    local d, s, p = false
+    local dragging = false
+    local dragStart = Vector3.new()
+    local startPos  = UDim2.new()
+
     handle.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1 then
-            d = true; s = i.Position; p = target.Position
-            i.Changed:Connect(function()
-                if i.UserInputState == Enum.UserInputState.End then d = false end
-            end)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = i.Position
+            startPos  = target.Position
         end
     end)
+
+    handle.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
     X_UIS.InputChanged:Connect(function(i)
-        if d and i.UserInputType == Enum.UserInputType.MouseMovement then
-            local dt = i.Position - s
-            target.Position = UDim2.new(p.X.Scale, p.X.Offset + dt.X, p.Y.Scale, p.Y.Offset + dt.Y)
+        if not dragging then return end
+        if i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch then
+            local delta = i.Position - dragStart
+            target.Position = UDim2.new(
+                startPos.X.Scale,  startPos.X.Offset  + delta.X,
+                startPos.Y.Scale,  startPos.Y.Offset  + delta.Y
+            )
         end
     end)
 end
